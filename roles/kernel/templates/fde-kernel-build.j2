@@ -1,0 +1,176 @@
+#!/bin/bash
+# managed by lmde7-fde (roles/kernel) — build, sign and package an upstream kernel
+#
+# Adapted from ~/git/scripts/kernel/build-latest-kernel.sh and make-kernel-deb.sh:
+# same kernel.org fetch, same sha256sums.asc verification, same "seed from the
+# running kernel's config then olddefconfig" approach, same `make bindeb-pkg`.
+# What this adds is signing with the Machine Owner Key and a build directory
+# chosen to survive this project's own CIS fstab. See KERNEL.md.
+#
+#   fde-kernel-build [VERSION]      # VERSION overrides kernel_version
+set -euo pipefail
+
+WORKDIR="{{ kernel_build_dir }}"
+OUTDIR="$WORKDIR/out"
+KEY="{{ mok_key }}"
+CERT="{{ mok_cert }}"
+VERSION="${1:-{{ kernel_version }}}"
+LOCALVERSION="{{ kernel_localversion }}"
+{% if kernel_seed_config | length > 0 %}
+SEED_CONFIG="{{ kernel_seed_config }}"
+{% else %}
+SEED_CONFIG="/boot/config-$(uname -r)"
+{% endif %}
+
+log() { echo ">> $*"; }
+die() { echo "error: $*" >&2; exit 1; }
+
+[ -r "$SEED_CONFIG" ] || die "can't read seed config: $SEED_CONFIG"
+
+# ---- resolve version ------------------------------------------------------
+
+if [ -z "$VERSION" ]; then
+    log "looking up latest stable release on kernel.org"
+    VERSION="$(curl -fsSL https://www.kernel.org/releases.json \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["latest_stable"]["version"])')"
+fi
+[ -n "$VERSION" ] || die "could not determine kernel version"
+log "target version: $VERSION (running: $(uname -r))"
+
+major="${VERSION%%.*}"
+tarball="linux-${VERSION}.tar.xz"
+url="https://cdn.kernel.org/pub/linux/kernel/v${major}.x/${tarball}"
+
+mkdir -p "$WORKDIR" "$OUTDIR"
+cd "$WORKDIR"
+
+# ---- fetch + verify -------------------------------------------------------
+
+if [ ! -f "$tarball" ]; then
+    log "downloading $url"
+    curl -fL# -o "$tarball.part" "$url"
+    mv "$tarball.part" "$tarball"
+else
+    log "reusing already-downloaded $tarball"
+fi
+
+log "verifying checksum"
+expected="$(curl -fsSL "https://cdn.kernel.org/pub/linux/kernel/v${major}.x/sha256sums.asc" \
+    | grep " ${tarball}\$" | awk '{print $1}')"
+[ -n "$expected" ] || die "couldn't find checksum for $tarball in sha256sums.asc"
+actual="$(sha256sum "$tarball" | awk '{print $1}')"
+[ "$expected" = "$actual" ] || die "checksum mismatch for $tarball (expected $expected, got $actual)"
+
+# ---- extract + configure --------------------------------------------------
+
+srcdir="linux-${VERSION}"
+[ -d "$srcdir" ] || { log "extracting $tarball"; tar xf "$tarball"; }
+cd "$srcdir"
+
+log "seeding config from $SEED_CONFIG"
+cp "$SEED_CONFIG" .config
+make olddefconfig
+
+{% if kernel_sign_modules | bool %}
+# Point module signing at the MOK. The stock value is "certs/signing_key.pem",
+# an ephemeral key the build generates and throws away, which means modules are
+# signed by nothing you can verify against later. SYSTEM_TRUSTED_KEYS embeds the
+# certificate in the kernel's own builtin keyring, so its modules validate even
+# before the MOK reaches the platform keyring.
+log "pointing module signing at the MOK"
+[ -r "{{ mok_pem }}" ] || die "no MOK at {{ mok_pem }} — run roles/mok first"
+./scripts/config --set-str MODULE_SIG_KEY "{{ mok_pem }}"
+./scripts/config --set-str SYSTEM_TRUSTED_KEYS "{{ mok_cert }}"
+./scripts/config --enable MODULE_SIG --enable MODULE_SIG_ALL
+{% endif %}
+{% if not kernel_debug_info | bool %}
+# DEBUG_INFO is a Kconfig choice, so it is turned off by selecting the NONE
+# member rather than by clearing the symbol. Takes BTF with it — see KERNEL.md.
+log "disabling CONFIG_DEBUG_INFO (build tree shrinks ~5x; BTF is lost with it)"
+./scripts/config --enable DEBUG_INFO_NONE
+{% endif %}
+make olddefconfig
+
+{% if kernel_sign_image | bool %}
+# EFI_STUB is what makes the bzImage a real PE/COFF binary. Without it sbsign
+# fails at the very end of a forty-minute build, so check now.
+grep -q '^CONFIG_EFI_STUB=y' .config \
+    || die "CONFIG_EFI_STUB is not set in the resulting config — the kernel image
+would not be a PE binary and could not be signed. Fix the seed config, or set
+kernel_sign_image: false."
+{% endif %}
+
+# ---- build ----------------------------------------------------------------
+
+jobs="$(nproc)"
+release="$(make -s kernelrelease${LOCALVERSION:+ LOCALVERSION="$LOCALVERSION"})"
+log "building $release (this will take a while; -j$jobs)"
+make -j"$jobs" bindeb-pkg ${LOCALVERSION:+LOCALVERSION="$LOCALVERSION"}
+
+# bindeb-pkg drops the .debs in the parent of the source tree.
+shopt -s nullglob
+debs=("$WORKDIR"/*.deb)
+# NB: "${debs[0]:-}" and not the array-length form — this file is a Jinja
+# template, and the array-length sigil reads as a Jinja comment opener.
+[ -n "${debs[0]:-}" ] || die "no .deb files produced in $WORKDIR"
+
+{% if not kernel_build_dbg_package | bool %}
+log "discarding the -dbg package (kernel_build_dbg_package=false)"
+rm -f "$WORKDIR"/linux-image-*-dbg_*.deb
+debs=("$WORKDIR"/*.deb)
+{% endif %}
+
+{% if kernel_sign_image | bool %}
+# ---- sign the kernel image, inside the package ----------------------------
+#
+# Signing /boot after installing would leave the *package* unsigned, so every
+# other machine pulling it from the repo would have to sign it again locally.
+# Repacking means the artifact that ships is the artifact that is signed.
+sign_deb_image() {
+    local deb="$1" tmp img
+    tmp="$(mktemp -d -p "$WORKDIR" repack.XXXXXX)"
+    dpkg-deb -R "$deb" "$tmp/x"
+    # -print -quit rather than "| head -1": under set -euo pipefail, head
+    # closing the pipe hands find a SIGPIPE and the script exits 141. Only bites
+    # once the output exceeds the pipe buffer, which /boot never will — but the
+    # construct without a pipe is both safer and a clearer statement of intent.
+    img="$(find "$tmp/x/boot" -maxdepth 1 -name 'vmlinuz-*' -type f -print -quit 2>/dev/null)"
+    if [ -z "$img" ]; then rm -rf "$tmp"; return 0; fi
+
+    if sbverify --cert "$CERT" "$img" >/dev/null 2>&1; then
+        log "  already signed: $(basename "$img")"
+    else
+        log "  signing $(basename "$img")"
+        sbsign --key "$KEY" --cert "$CERT" --output "$img.signed" "$img"
+        mv "$img.signed" "$img"
+    fi
+
+    # The signature changes the file, so md5sums has to be rebuilt or `dpkg -V`
+    # reports the kernel as modified for the life of the installation.
+    ( cd "$tmp/x" && find . -type f ! -path './DEBIAN/*' -printf '%P\0' \
+        | LC_ALL=C sort -z | xargs -0 -r md5sum > DEBIAN/md5sums )
+
+    dpkg-deb --build "$tmp/x" "$deb.new" >/dev/null
+    mv "$deb.new" "$deb"
+    rm -rf "$tmp"
+}
+
+[ -r "$KEY" ] || die "no MOK private key at $KEY — run roles/mok first"
+log "signing kernel images with the MOK"
+for deb in "${debs[@]}"; do
+    case "$(basename "$deb")" in
+        linux-image-*) sign_deb_image "$deb" ;;
+    esac
+done
+{% endif %}
+
+# ---- collect --------------------------------------------------------------
+
+log "collecting packages into $OUTDIR"
+rm -f "$OUTDIR"/*.deb
+for deb in "${debs[@]}"; do
+    mv "$deb" "$OUTDIR/"
+done
+
+log "done:"
+printf '   %s\n' "$OUTDIR"/*.deb

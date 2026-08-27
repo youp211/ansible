@@ -1,0 +1,63 @@
+---
+- name: Install the pruning rules snippet
+  ansible.builtin.template:
+    src: 99_fde_local.j2
+    dest: "{{ target_mount }}/etc/aide/aide.conf.d/99_fde_local"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Point the AIDE wrappers at the configured behaviour
+  # /etc/default/aide is a ucf conffile sourced by both aideinit and
+  # dailyaidecheck; only the keys we own are rewritten, so package upgrades
+  # keep bringing in new options.
+  ansible.builtin.lineinfile:
+    path: "{{ target_mount }}/etc/default/aide"
+    regexp: "^#?[ \t]*{{ item.key }}="
+    line: "{{ item.key }}={{ item.value }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { key: CRON_DAILY_RUN, value: "{{ 'yes' if aide_daily_enabled | bool else 'no' }}" }
+    - { key: COMMAND, value: "{{ aide_daily_command }}" }
+    - { key: COPYNEWDB, value: "{{ aide_daily_copynewdb }}" }
+    - { key: MAILTO, value: "{{ aide_mailto }}" }
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+
+- name: Enable or disable the shipped daily AIDE timer
+  # aide-common enables dailyaidecheck.timer on install; this makes the state
+  # follow aide_daily_enabled on a rerun.
+  ansible.builtin.command: >-
+    chroot {{ target_mount }} systemctl
+    {{ 'enable' if aide_daily_enabled | bool else 'disable' }} dailyaidecheck.timer
+  register: aide_timer
+  changed_when: "'Created symlink' in (aide_timer.stderr + aide_timer.stdout)
+                 or 'Removed' in (aide_timer.stderr + aide_timer.stdout)"
+
+- name: Validate the assembled AIDE configuration
+  # @@x_include pulls in ~250 snippets, some of them executable; a syntax error
+  # in any of them (ours included) makes every later aide run a no-op.
+  ansible.builtin.command: >-
+    chroot {{ target_mount }} aide --config=/etc/aide/aide.conf --config-check
+  register: aide_cfg_check
+  changed_when: false
+  failed_when: false
+
+- name: Show the AIDE config-check output
+  ansible.builtin.debug:
+    msg: "{{ (aide_cfg_check.stderr_lines + aide_cfg_check.stdout_lines) | reject('equalto', '') | list }}"
+  when: aide_cfg_check.rc | default(0) != 0
+
+- name: Assert the AIDE configuration parses
+  ansible.builtin.assert:
+    that: aide_cfg_check.rc | default(0) == 0
+    fail_msg: >-
+      "aide --config-check" rejected /etc/aide/aide.conf (rc={{ aide_cfg_check.rc | default('unknown') }}).
+      The usual cause is a bad regex in aide_exclude_paths — those entries are
+      AIDE regexes, not shell globs, so metacharacters must be escaped. Fix the
+      list in group_vars/all.yml, or set aide_require_config_check=false to
+      proceed with an AIDE that will not run.
+    success_msg: "AIDE configuration parses."
+  when: aide_require_config_check | bool

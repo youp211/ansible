@@ -1,0 +1,15 @@
+---
+- name: Refresh the apt index inside the target
+  ansible.builtin.command: chroot {{ target_mount }} apt-get update
+  changed_when: false
+  failed_when: false
+
+- name: Install efitools and sbsigntool
+  # efitools supplies cert-to-efi-sig-list, sign-efi-sig-list and efi-updatevar;
+  # sbsigntool supplies sbverify, used to prove the db cert can actually verify
+  # the UKI before any firmware variable is written.
+  ansible.builtin.command: >-
+    chroot {{ target_mount }} env DEBIAN_FRONTEND=noninteractive
+    apt-get install -y {{ secureboot_packages | join(' ') }}
+  register: sb_apt
+  changed_when: "'0 newly installed' not in sb_apt.stdout"

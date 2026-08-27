@@ -1,0 +1,64 @@
+#!/bin/bash
+# managed by lmde7-fde (roles/kernel) — keep every installed kernel bootable
+#
+# Adapted from ~/git/scripts/kernel/keep-all-kernels.sh, with one deliberate
+# difference: it does NOT sed GRUB_TIMEOUT / GRUB_TIMEOUT_STYLE into
+# /etc/default/grub. This tree owns the boot menu through grub.d drop-ins, and
+# editing the base file would fight 90-fde-hardening.cfg on every run. The
+# submenu setting goes into a drop-in of our own instead.
+set -euo pipefail
+
+APT_DROPIN="/etc/apt/apt.conf.d/99-keep-all-kernels.conf"
+GRUB_DROPIN="/etc/default/grub.d/92-fde-kernels.cfg"
+
+log() { echo ">> $*"; }
+
+if [ "${1:-}" = "--status" ]; then
+    echo "Installed kernel packages:"
+    dpkg -l 'linux-image-*' 2>/dev/null | awk '/^ii/{print "  " $2}'
+    echo
+    echo "Currently running: $(uname -r)"
+    echo
+    echo "GRUB boot entries:"
+    awk -F"'" '/menuentry |submenu /{print "  " $2}' /boot/grub/grub.cfg 2>/dev/null
+    exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || { echo "must run as root" >&2; exit 1; }
+
+# ---- 1. never let apt autoremove a kernel --------------------------------
+# Old kernels are the fallback when a self-built one does not boot. On a box
+# whose root is behind a LUKS passphrase, "boot the previous kernel" is a much
+# cheaper recovery than a live ISO.
+log "writing $APT_DROPIN"
+cat > "$APT_DROPIN" <<'EOF'
+// managed by lmde7-fde (roles/kernel) — never let `apt autoremove` (or
+// unattended-upgrades) remove ANY installed kernel package, however old.
+APT::NeverAutoRemove {
+    "^linux-image-.*";
+    "^linux-headers-.*";
+    "^linux-modules-.*";
+    "^linux-modules-extra-.*";
+};
+APT::Never-MarkAutoRemove {
+    "^linux-image-.*";
+    "^linux-headers-.*";
+    "^linux-modules-.*";
+    "^linux-modules-extra-.*";
+};
+EOF
+
+# ---- 2. show every kernel at the top level of the menu --------------------
+log "writing $GRUB_DROPIN"
+mkdir -p "$(dirname "$GRUB_DROPIN")"
+cat > "$GRUB_DROPIN" <<'EOF'
+# managed by lmde7-fde (roles/kernel) — sourced by /etc/default/grub via grub.d
+# Every installed kernel at the top level, not buried in a submenu: picking an
+# older kernel is the first recovery step when a new one misbehaves.
+GRUB_DISABLE_SUBMENU=y
+EOF
+
+log "regenerating grub.cfg"
+if command -v update-grub >/dev/null 2>&1; then update-grub; else grub-mkconfig -o /boot/grub/grub.cfg; fi
+
+log "done."

@@ -1,0 +1,87 @@
+---
+- name: "{{ mig.name }}: compute paths"
+  ansible.builtin.set_fact:
+    mig_dev: "/dev/{{ vg_name }}/{{ mig.name }}"
+    mig_path: "{{ target_mount }}{{ mig.mount }}"
+    mig_stage: "/mnt/mig-{{ mig.name }}"
+
+- name: "{{ mig.name }}: is the target path already a mountpoint?"
+  ansible.builtin.command: findmnt -no SOURCE {{ mig_path }}
+  register: mig_mounted
+  changed_when: false
+  failed_when: false
+
+- name: "{{ mig.name }}: migrate data and mount the LV"
+  when: mig_mounted.rc != 0
+  block:
+    - name: "{{ mig.name }}: mount LV at staging point"
+      ansible.builtin.shell: |
+        set -e
+        mkdir -p {{ mig_stage }}
+        mountpoint -q {{ mig_stage }} || mount -t {{ mig.fs }} {{ mig_dev }} {{ mig_stage }}
+      changed_when: true
+
+    - name: "{{ mig.name }}: does the LV already hold data (installer used it)?"
+      ansible.builtin.shell: |
+        set -o pipefail
+        find {{ mig_stage }} -mindepth 1 -maxdepth 1 \
+          ! -name 'lost+found' ! -name '.fscrypt' | head -1
+      args:
+        executable: /bin/bash
+      register: lv_content
+      changed_when: false
+
+    - name: "{{ mig.name }}: does the root filesystem hold data at {{ mig.mount }}?"
+      ansible.builtin.shell: |
+        set -o pipefail
+        [ -d {{ mig_path }} ] && find {{ mig_path }} -mindepth 1 -maxdepth 1 | head -1 || true
+      args:
+        executable: /bin/bash
+      register: rootfs_content
+      changed_when: false
+
+    - name: "{{ mig.name }}: rsync data from root filesystem onto the LV"
+      ansible.builtin.command: >-
+        rsync -aHAXS {{ mig_path }}/ {{ mig_stage }}/
+      when:
+        - lv_content.stdout | trim | length == 0
+        - rootfs_content.stdout | trim | length > 0
+      changed_when: true
+
+    - name: "{{ mig.name }}: WARNING — both the LV and the rootfs hold data"
+      ansible.builtin.debug:
+        msg: >-
+          {{ mig_path }} has content AND the LV already holds data. Not copying
+          and NOT deleting anything — the rootfs copy stays shadowed under the
+          mount. Inspect manually if you need the space back.
+      when:
+        - lv_content.stdout | trim | length > 0
+        - rootfs_content.stdout | trim | length > 0
+
+    - name: "{{ mig.name }}: clear the now-copied shadowed data on the root filesystem"
+      ansible.builtin.command: find {{ mig_path }} -mindepth 1 -delete
+      when:
+        - lv_content.stdout | trim | length == 0
+        - rootfs_content.stdout | trim | length > 0
+      changed_when: true
+
+    - name: "{{ mig.name }}: ensure mountpoint directory exists"
+      ansible.builtin.file:
+        path: "{{ mig_path }}"
+        state: directory
+        mode: "0755"
+
+    - name: "{{ mig.name }}: unmount staging point"
+      ansible.builtin.command: umount {{ mig_stage }}
+      changed_when: true
+
+    - name: "{{ mig.name }}: mount LV at its real path"
+      ansible.builtin.command: mount -t {{ mig.fs }} {{ mig_dev }} {{ mig_path }}
+      changed_when: true
+
+- name: "{{ mig.name }}: enforce mountpoint permissions"
+  ansible.builtin.file:
+    path: "{{ mig_path }}"
+    state: directory
+    mode: "{{ '1777' if mig.mount in ['/tmp', '/var/tmp']
+              else ('0700' if mig.mount == '/var/log/audit' else '0755') }}"

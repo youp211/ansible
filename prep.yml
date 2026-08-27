@@ -1,0 +1,30 @@
+---
+# PHASE 1 — run from the LMDE 7 live session BEFORE launching the installer.
+# Destroys and rebuilds {{ target_disk }}: GPT -> LUKS2 -> LVM -> filesystems.
+# Leaves the container OPEN and the VG ACTIVE so the installer can see the LVs.
+
+- name: "Phase 1: provision encrypted disk layout"
+  hosts: live
+  become: true
+  vars_prompt:
+    - name: luks_passphrase
+      prompt: "LUKS recovery passphrase (keyslot 0, argon2id — your TPM fallback)"
+      private: true
+      confirm: true
+
+  roles:
+    - preflight
+    - partition
+    - luks
+    - lvm
+    - filesystems
+
+  post_tasks:
+    - name: Show next step
+      ansible.builtin.debug:
+        msg:
+          - "Disk is provisioned and left OPEN."
+          - "Next: sudo ansible-playbook mount-for-installer.yml"
+          - "Then: installer -> Manual Partitioning -> 'Expert mode'"
+          - "(everything is pre-mounted at /target; assign nothing, format nothing)."
+          - "When the installer finishes: DO NOT REBOOT. Run finalize.yml."

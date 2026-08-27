@@ -1,0 +1,62 @@
+---
+- name: Install the freshly built kernel packages
+  # dpkg -i, not apt: these are local files with no repo behind them. The
+  # linux-image postinst runs the kernel hooks this tree already installs —
+  # zz-update-uki rebuilds and re-signs the UKIs, zzz-fde-aide-accept
+  # re-baselines /boot — so a new kernel does not leave the AIDE boot check red.
+  ansible.builtin.shell: |
+    set -o pipefail
+    cd {{ kernel_build_dir }}/out
+    dpkg -i linux-image-*.deb linux-headers-*.deb linux-libc-dev_*.deb 2>&1
+  args:
+    executable: /bin/bash
+    chdir: "{{ target_mount }}"
+  register: kernel_dpkg
+  changed_when: true
+  when: target_mount == '/'
+
+- name: Install the freshly built kernel packages (chroot)
+  ansible.builtin.shell: |
+    set -o pipefail
+    chroot {{ target_mount }} sh -c 'cd {{ kernel_build_dir }}/out && dpkg -i linux-image-*.deb linux-headers-*.deb linux-libc-dev_*.deb' 2>&1
+  args:
+    executable: /bin/bash
+  register: kernel_dpkg_chroot
+  changed_when: true
+  when: target_mount != '/'
+
+- name: Relabel /boot after the kernel install
+  # dpkg does not relabel what it unpacks. New files under /boot normally
+  # inherit the right type from the parent directory's transition rules, but
+  # "normally" is not "always" and restorecon is cheap.
+  ansible.builtin.command: chroot {{ target_mount }} restorecon -RF /boot
+  changed_when: true
+  failed_when: false
+  when: selinux_enabled | bool
+
+- name: Keep every installed kernel bootable
+  ansible.builtin.template:
+    src: fde-keep-kernels.j2
+    dest: "{{ target_mount }}/usr/local/sbin/fde-keep-kernels"
+    owner: root
+    group: root
+    mode: "0755"
+  when: kernel_keep_all | bool
+
+- name: Apply the kernel retention policy
+  ansible.builtin.command: chroot {{ target_mount }} /usr/local/sbin/fde-keep-kernels
+  register: kernel_keep
+  changed_when: true
+  when: kernel_keep_all | bool
+
+- name: Installed kernels
+  ansible.builtin.command: chroot {{ target_mount }} /usr/local/sbin/fde-keep-kernels --status
+  register: kernel_status
+  changed_when: false
+  failed_when: false
+  when: kernel_keep_all | bool
+
+- name: Show what is installed and bootable
+  ansible.builtin.debug:
+    msg: "{{ kernel_status.stdout_lines }}"
+  when: kernel_keep_all | bool

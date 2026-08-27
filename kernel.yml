@@ -1,0 +1,63 @@
+---
+# KERNEL + MOK — the signing key, and the self-built kernel it signs.
+#
+#   sudo ansible-playbook kernel.yml -e target_mount=/                    # MOK only
+#   sudo ansible-playbook kernel.yml -e target_mount=/ -e kernel_build_enabled=true
+#   sudo ansible-playbook kernel.yml -e target_mount=/ -e kernel_version=6.12.30
+#
+# finalize.yml runs roles/mok and NEVER roles/kernel: the live ISO has no
+# toolchain, no room, and a forty-minute failure has no business sitting between
+# you and a working crypttab. Read KERNEL.md before the first build — it needs
+# tens of GiB on a filesystem this project's own fstab does not mount noexec.
+
+- name: "Kernel: MOK, signed build, packaging"
+  hosts: live
+  become: true
+  pre_tasks:
+    - name: Look for an installed system at the target mount
+      ansible.builtin.stat:
+        path: "{{ target_mount }}/etc/os-release"
+      register: kernel_target_os
+
+    - name: Assert the target holds an installed system
+      ansible.builtin.assert:
+        that: kernel_target_os.stat.exists
+        fail_msg: >-
+          No {{ target_mount }}/etc/os-release — nothing is installed there.
+          On the booted system run this with -e target_mount=/ ; from the live
+          ISO mount the layout first (mount-for-installer.yml).
+        success_msg: "Installed system found at {{ target_mount }}."
+
+  roles:
+    - config_contract
+    - mok
+    - kernel
+
+  post_tasks:
+    - name: Stage the MOK enrollment for the next boot
+      # Deliberately here and not inside roles/mok's main.yml: generating the
+      # key is harmless anywhere, but importing it writes firmware state and
+      # costs a MokManager screen at the next boot. This is the moment that
+      # earns it — the key now signs a kernel, or is about to sign UKIs.
+      ansible.builtin.include_role:
+        name: mok
+        tasks_from: enroll.yml
+      when:
+        - mok_enabled | bool
+        - mok_enroll | bool
+
+    - name: Next steps
+      ansible.builtin.debug:
+        msg:
+          - >-
+            {{ 'If an enrollment was staged above, the one-shot MokManager password
+            was printed with it — write it down before rebooting.'
+            if mok_enabled | bool and mok_enroll | bool
+            else 'MOK enrollment not staged this run (mok_enroll=false).' }}
+          - "Confirm afterwards with: mokutil --test-key {{ mok_der }}"
+          - >-
+            {{ 'A new kernel is installed. Reboot and pick it from the GRUB menu;
+            the previous kernel stays available as the fallback.'
+            if kernel_build_enabled | bool and kernel_install | bool
+            else 'No kernel was built or installed this run.' }}
+          - "Verification checklist: VERIFY.md section 13. Operating notes: KERNEL.md."

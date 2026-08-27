@@ -1,0 +1,11 @@
+#!/bin/sh
+# managed by lmde7-fde — keep UKIs in sync with installed kernels
+#
+# update-grub afterwards, deliberately: run-parts is lexical, so Debian's
+# zz-update-grub has ALREADY run by the time zz-update-uki does. Without this
+# second pass a freshly built UKI would not appear in the GRUB menu until the
+# next unrelated update-grub, and "lmde-uki-latest" would still point at the
+# previous kernel.
+set -e
+/usr/local/sbin/update-uki
+command -v update-grub >/dev/null 2>&1 && update-grub || true

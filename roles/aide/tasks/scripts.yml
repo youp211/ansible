@@ -1,0 +1,72 @@
+---
+- name: Install the boot-chain check script
+  ansible.builtin.template:
+    src: fde-aide-boot-check.j2
+    dest: "{{ target_mount }}/usr/local/sbin/fde-aide-boot-check"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the boot-chain accept (re-baseline) script
+  ansible.builtin.template:
+    src: fde-aide-boot-accept.j2
+    dest: "{{ target_mount }}/usr/local/sbin/fde-aide-boot-accept"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the per-boot integrity check unit
+  ansible.builtin.template:
+    src: fde-aide-boot-check.service.j2
+    dest: "{{ target_mount }}/etc/systemd/system/fde-aide-boot-check.service"
+    owner: root
+    group: root
+    mode: "0644"
+  when: aide_boot_check | bool
+
+- name: Enable or disable the per-boot integrity check
+  ansible.builtin.command: >-
+    chroot {{ target_mount }} systemctl
+    {{ 'enable' if aide_boot_check | bool else 'disable' }} fde-aide-boot-check.service
+  register: aide_check_unit
+  failed_when:
+    - aide_check_unit.rc != 0
+    - aide_boot_check | bool
+  changed_when: "'Created symlink' in (aide_check_unit.stderr + aide_check_unit.stdout)
+                 or 'Removed' in (aide_check_unit.stderr + aide_check_unit.stdout)"
+
+- name: Remove the per-boot integrity check unit when disabled
+  ansible.builtin.file:
+    path: "{{ target_mount }}/etc/systemd/system/fde-aide-boot-check.service"
+    state: absent
+  when: not aide_boot_check | bool
+
+- name: Ensure the kernel and initramfs hook directories exist
+  ansible.builtin.file:
+    path: "{{ target_mount }}{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ aide_accept_hook_dirs }}"
+  when: aide_boot_accept_on_kernel_update | bool
+
+- name: Re-baseline /boot after legitimate kernel and initramfs changes
+  # Named zzz_ so run-parts calls it after zz-update-grub: the new grub.cfg has
+  # to be on disk before the baseline is taken, or the next boot check alarms
+  # on a change you made yourself.
+  ansible.builtin.template:
+    src: zzz-fde-aide-accept.j2
+    dest: "{{ target_mount }}{{ item }}/zzz-fde-aide-accept"
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ aide_accept_hook_dirs }}"
+  when: aide_boot_accept_on_kernel_update | bool
+
+- name: Remove the accept hooks when disabled
+  ansible.builtin.file:
+    path: "{{ target_mount }}{{ item }}/zzz-fde-aide-accept"
+    state: absent
+  loop: "{{ aide_accept_hook_dirs }}"
+  when: not aide_boot_accept_on_kernel_update | bool

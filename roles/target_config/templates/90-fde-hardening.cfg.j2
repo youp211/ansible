@@ -1,0 +1,14 @@
+# managed by lmde7-fde finalize — sourced by /etc/default/grub via grub.d
+{% if boot_disable_plymouth | bool %}
+# Plymouth off: drop "splash" and disable the daemon outright. Keeps the
+# initramfs passphrase/PIN prompt on the plain console.
+GRUB_CMDLINE_LINUX_DEFAULT="$(echo "$GRUB_CMDLINE_LINUX_DEFAULT" | sed -e 's/\bsplash\b//g' -e 's/\bplymouth\.enable=[01]\b//g' -e 's/  */ /g' -e 's/ *$//')"
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT plymouth.enable=0"
+{% endif %}
+{% if boot_strip_quiet | bool %}
+GRUB_CMDLINE_LINUX_DEFAULT="$(echo "$GRUB_CMDLINE_LINUX_DEFAULT" | sed -e 's/\bquiet\b//g' -e 's/  */ /g' -e 's/ *$//')"
+{% endif %}
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT {{ kernel_cmdline_hardening }}{{ ' resume=' ~ swap_mapper if hibernate_enabled | bool else '' }}"
+{% if grub_disable_os_prober | bool %}
+GRUB_DISABLE_OS_PROBER=true
+{% endif %}

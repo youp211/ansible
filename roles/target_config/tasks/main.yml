@@ -1,0 +1,13 @@
+---
+- name: Install packages into the target
+  ansible.builtin.import_tasks: packages.yml
+
+- name: Write crypttab and the CIS-hardened fstab
+  ansible.builtin.import_tasks: crypttab_fstab.yml
+
+- name: Configure fscrypt inside the target (no policies applied)
+  ansible.builtin.import_tasks: fscrypt.yml
+  when: fscrypt_configure | bool
+
+- name: GRUB hardening, resume wiring, initramfs configuration
+  ansible.builtin.import_tasks: grub_initramfs.yml

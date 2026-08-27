@@ -1,0 +1,109 @@
+---
+- name: Set the policy mode and store in /etc/selinux/config
+  # Created by policycoreutils' postinst (not a conffile, not shipped in any
+  # .deb), so only the two keys we own are rewritten and anything the package
+  # adds later survives — the same treatment /etc/default/aide gets.
+  #
+  # Anchored at ^SELINUX= rather than the aide role's ^#?[ \t]*KEY= : this file
+  # ships a comment block whose lines literally begin "# SELINUX= can take one
+  # of these three values", and a laxer regexp rewrites the documentation
+  # instead of the setting.
+  ansible.builtin.lineinfile:
+    path: "{{ target_mount }}/etc/selinux/config"
+    regexp: "^{{ item.key }}="
+    line: "{{ item.key }}={{ item.value }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { key: SELINUX, value: "{{ selinux_mode }}" }
+    - { key: SELINUXTYPE, value: "{{ selinux_policy_type }}" }
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+
+- name: Apply SELinux booleans
+  # -N/--noreload is the only form that works here: a reload needs selinuxfs,
+  # which a live-ISO chroot does not have. The local boolean file is written
+  # either way and takes effect on the next policy load.
+  #
+  # Unconditionally "changed": semanage rewrites the active store on every
+  # invocation and there is no offline way to read the current value back
+  # (getsebool needs a loaded policy).
+  ansible.builtin.command: >-
+    chroot {{ target_mount }} semanage boolean -m -N
+    {{ '--on' if item.value | bool else '--off' }} {{ item.key }}
+  loop: "{{ selinux_booleans | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+  register: selinux_bool
+  failed_when: false
+  changed_when: selinux_bool.rc == 0
+  when: selinux_booleans | length > 0
+
+- name: Report booleans that would not apply
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: semanage could not set {{ item.item.key }}={{ item.item.value }}
+      (rc={{ item.rc }}). Check the name against "semanage boolean -l" on the
+      booted system; the rest of the SELinux configuration is unaffected.
+      Last line: {{ (item.stderr_lines | default([]) | last)
+                    | default('see semanage output', true) }}
+  loop: "{{ selinux_bool.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.key | default('n/a') }}"
+  when:
+    - selinux_booleans | length > 0
+    - item.rc | default(0) != 0
+
+- name: Enable auditd so AVC denials are collectable
+  # Without it, kernel audit records go to the ring buffer and ausearch /
+  # audit2allow have nothing to read — which makes the permissive -> enforcing
+  # promotion path guesswork. This is also what finally puts the var_log_audit
+  # LV to work.
+  ansible.builtin.command: chroot {{ target_mount }} systemctl enable auditd.service
+  register: selinux_auditd_unit
+  changed_when: "'Created symlink' in (selinux_auditd_unit.stderr + selinux_auditd_unit.stdout)"
+  when: selinux_install_auditd | bool
+
+- name: Look for the AppArmor unit in the target
+  ansible.builtin.stat:
+    path: "{{ target_mount }}/usr/lib/systemd/system/apparmor.service"
+  register: selinux_aa_unit
+  when: selinux_disable_apparmor | bool
+
+- name: Hand the LSM slot over from AppArmor to SELinux
+  # DISABLED, deliberately not masked. apparmor.service already carries
+  # ConditionSecurity=apparmor, so with SELinux holding the LSM slot systemd
+  # skips it cleanly and it loads no profiles either way — masking adds no
+  # safety, and it breaks package installs.
+  #
+  # Measured on the live box: with the unit MASKED, a maintainer script gets
+  #   "Failed to reload apparmor.service: Unit apparmor.service is masked."
+  # (this is what Discord's postinst hit). Merely DISABLED, the three calls
+  # Debian maintainer scripts actually make all return rc=0 in silence —
+  # systemctl start / restart / try-reload-or-restart — because the condition
+  # skips them, while the unit stays inactive and aa-enabled still says "No".
+  # Only a bare `reload` still complains, and that is the rarest pattern.
+  #
+  # roles/selinux/tasks/disable.yml re-enables it, and also unmasks, to repair
+  # boxes that an earlier version of this role masked.
+  when:
+    - selinux_disable_apparmor | bool
+    - selinux_aa_unit.stat.exists | default(false)
+  block:
+    - name: Unmask apparmor.service if an earlier run masked it
+      ansible.builtin.command: chroot {{ target_mount }} systemctl unmask apparmor.service
+      register: selinux_aa_unmask
+      failed_when: false
+      changed_when: "'Removed' in (selinux_aa_unmask.stderr + selinux_aa_unmask.stdout)"
+
+    - name: Disable apparmor.service
+      ansible.builtin.command: chroot {{ target_mount }} systemctl disable apparmor.service
+      register: selinux_aa_disable
+      failed_when: false
+      changed_when: "'Removed' in (selinux_aa_disable.stderr + selinux_aa_disable.stdout)"
+
+- name: Make the unit changes visible to a running systemd
+  ansible.builtin.command: chroot {{ target_mount }} systemctl daemon-reload
+  changed_when: true
+  when: target_mount == '/'

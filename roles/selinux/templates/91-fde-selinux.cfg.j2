@@ -1,0 +1,15 @@
+# managed by lmde7-fde (roles/selinux) — sourced by /etc/default/grub via grub.d
+#
+# Sorts after 90-fde-hardening.cfg, so this appends to a GRUB_CMDLINE_LINUX_DEFAULT
+# that already carries the hardening set.
+#
+# _DEFAULT and not GRUB_CMDLINE_LINUX on purpose: GRUB's recovery entries omit
+# _DEFAULT, so recovery mode boots with no SELinux at all — a door back into a
+# box whose policy you have broken. See SELINUX.md "The recovery menu entry".
+#
+# The sed strips first: selinux-activate(8) writes "security=selinux" straight
+# into /etc/default/grub, and a hand-run of it would otherwise leave a second,
+# possibly stale, security= on the line.
+GRUB_CMDLINE_LINUX_DEFAULT="$(echo "$GRUB_CMDLINE_LINUX_DEFAULT" | sed -e 's/\bsecurity=[a-zA-Z0-9_-]*\b//g' -e 's/\bselinux=[01]\b//g' -e 's/  */ /g' -e 's/ *$//')"
+GRUB_CMDLINE_LINUX="$(echo "$GRUB_CMDLINE_LINUX" | sed -e 's/\bsecurity=[a-zA-Z0-9_-]*\b//g' -e 's/\bselinux=[01]\b//g' -e 's/  */ /g' -e 's/ *$//')"
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT {{ selinux_cmdline }}"

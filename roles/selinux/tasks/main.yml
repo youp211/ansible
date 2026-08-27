@@ -1,0 +1,60 @@
+---
+# SELinux — mandatory access control on the installed system, replacing the
+# AppArmor that LMDE ships enabled. See SELINUX.md for the threat model, the
+# three kernel facts that shape the design, the permissive -> enforcing
+# promotion path, and the escape hatches.
+#
+# Like roles/aide, this role is structurally incapable of aborting finalize
+# before the boot chain is complete: it runs after target_config has written
+# crypttab and fstab, and the package install is non-fatal with everything
+# downstream gated on selinux_installed.
+#
+# The one thing it will never do is write "security=selinux" onto the kernel
+# command line without the policy actually being on disk — an LSM with no rules
+# to load is a worse place to be than no LSM at all.
+
+- name: Sanity — the policy package must match selinux_policy_type
+  # SELINUXTYPE in /etc/selinux/config names a policy store directory; if the
+  # matching selinux-policy-* package is not in the install list, the store
+  # never appears and every boot logs "policy load failed".
+  ansible.builtin.assert:
+    that: "'selinux-policy-' ~ selinux_policy_type in selinux_packages"
+    fail_msg: >-
+      selinux_policy_type is '{{ selinux_policy_type }}' but
+      selinux-policy-{{ selinux_policy_type }} is not in selinux_packages.
+      SELINUXTYPE and the installed policy have to name the same store. Add the
+      package (and drop the one you are replacing) in group_vars/all.yml.
+    success_msg: "Policy type '{{ selinux_policy_type }}' matches the package list."
+  when: selinux_enabled | bool
+
+- name: Undo SELinux activation (selinux_enabled=false)
+  ansible.builtin.import_tasks: disable.yml
+  when: not selinux_enabled | bool
+
+- name: Install the SELinux policy and tooling into the target
+  ansible.builtin.import_tasks: packages.yml
+  when: selinux_enabled | bool
+
+- name: Policy mode, booleans, auditd, AppArmor handover
+  ansible.builtin.import_tasks: config.yml
+  when:
+    - selinux_enabled | bool
+    - selinux_installed | default(false) | bool
+
+- name: Schedule the filesystem relabel
+  ansible.builtin.import_tasks: relabel.yml
+  when:
+    - selinux_enabled | bool
+    - selinux_installed | default(false) | bool
+
+- name: Kernel command line (GRUB drop-in)
+  ansible.builtin.import_tasks: boot.yml
+  when:
+    - selinux_enabled | bool
+    - selinux_installed | default(false) | bool
+
+- name: Report what the next boot will do
+  ansible.builtin.import_tasks: verify.yml
+  when:
+    - selinux_enabled | bool
+    - selinux_installed | default(false) | bool

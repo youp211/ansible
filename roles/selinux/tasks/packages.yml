@@ -1,0 +1,56 @@
+---
+# Non-fatal by design, exactly as roles/aide/tasks/packages.yml is: a chroot
+# without working DNS must not cost the rest of the run. Everything downstream
+# is gated on selinux_installed — most importantly the GRUB drop-in.
+
+- name: Refresh the apt index inside the target
+  ansible.builtin.command: chroot {{ target_mount }} apt-get update
+  changed_when: false
+  failed_when: false
+
+- name: Install the SELinux policy and tooling into the target (non-fatal)
+  # selinux-policy-default's postinst runs semodule over ~350 modules; it takes
+  # a minute or two. It sources /etc/selinux/config, which policycoreutils'
+  # postinst creates (SELINUX=permissive, SELINUXTYPE=default) — and dpkg
+  # configures policycoreutils first because the policy Depends on it, so the
+  # ordering is guaranteed rather than lucky.
+  #
+  # In a live-ISO chroot `selinuxenabled` is false, so the postinst passes -n to
+  # semodule and builds the store without trying to load it into the running
+  # kernel. That is what makes an offline install work at all.
+  ansible.builtin.command: >-
+    chroot {{ target_mount }} env DEBIAN_FRONTEND=noninteractive
+    apt-get install -y
+    {{ (selinux_packages + (selinux_audit_packages if selinux_install_auditd | bool else [])) | join(' ') }}
+  register: selinux_apt
+  failed_when: false
+  changed_when:
+    - selinux_apt.rc == 0
+    - "'0 newly installed' not in selinux_apt.stdout"
+
+- name: Confirm the policy store actually landed in the target
+  # rc==0 is not enough on its own: the store directory is what SELINUXTYPE
+  # points at, and it is built by the postinst rather than shipped in the .deb.
+  ansible.builtin.stat:
+    path: "{{ target_mount }}/etc/selinux/{{ selinux_policy_type }}/policy"
+  register: selinux_store
+
+- name: Record whether SELinux is usable in the target
+  # default() so a --check run, where the command tasks are skipped, previews
+  # cleanly instead of dying on an undefined rc.
+  ansible.builtin.set_fact:
+    selinux_installed: "{{ selinux_apt.rc | default(1) == 0 and selinux_store.stat.exists | default(false) }}"
+
+- name: Report a SELinux install failure without aborting the run
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: the SELinux stack did not install into the target
+      (apt rc={{ selinux_apt.rc | default('skipped') }}, policy store
+      {{ 'present' if selinux_store.stat.exists | default(false) else 'MISSING' }});
+      SELinux is NOT configured and "security=selinux" has deliberately NOT been
+      put on the kernel command line. The FDE configuration is unaffected and
+      AppArmor is still in force. Fix networking in the target and re-run
+      "ansible-playbook selinux.yml -e target_mount={{ target_mount }}".
+      Last line: {{ (selinux_apt.stderr_lines | default([]) | last)
+                    | default('see apt output', true) }}
+  when: not selinux_installed | bool

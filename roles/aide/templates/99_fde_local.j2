@@ -1,0 +1,18 @@
+# managed by lmde7-fde (roles/aide) — do not edit; edit aide_exclude_paths in
+# group_vars/all.yml and re-run aide.yml instead.
+#
+# Debian's shipped configuration already checks the whole filesystem with the
+# maximal attribute set (99_aide_root: "/ 0 Full") and copes with the ESP's
+# synthesized FAT inode numbers (98_aide_vfat: "/ =vfat Full-i"). /boot and
+# /boot/efi therefore need no rules of their own here — anything we added would
+# duplicate a rule that is already as strict as AIDE gets.
+#
+# What is left is pruning the trees whose churn would drown the report.
+# "-<regex> 0" is a non-recursive negative rule (AIDE >= 0.19) with an empty
+# restriction: the tree is not descended into at all, so nothing below it can
+# be pulled back in by another snippet's rule.
+#
+# The entries are AIDE regexes anchored at the start of the path, not globs.
+{% for path in aide_exclude_paths %}
+-{{ path }}$ 0
+{% endfor %}

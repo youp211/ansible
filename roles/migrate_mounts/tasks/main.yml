@@ -1,0 +1,12 @@
+---
+# The Mint installer only populates LVs the user managed to assign. For every
+# other LV, its data currently sits on the root filesystem. This role moves
+# that data onto the correct LV and mounts each LV at its target path, in
+# declared order (parents before children: var -> var_log -> var_log_audit).
+
+- name: Migrate and mount each non-root LV
+  ansible.builtin.include_tasks: migrate_one.yml
+  loop: "{{ lvs | rejectattr('name', 'in', ['root', 'swap']) | list }}"
+  loop_control:
+    loop_var: mig
+    label: "{{ mig.name }} -> {{ mig.mount }}"

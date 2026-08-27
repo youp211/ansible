@@ -1,0 +1,86 @@
+---
+# prep is intentionally non-idempotent: every confirmed run re-provisions from
+# zero. First tear down any half-built state from a previous attempt.
+
+- name: Tear down any previous stack on this disk (best effort)
+  ansible.builtin.shell: |
+    swapoff -a || true
+    vgchange -an {{ vg_name }} 2>/dev/null || true
+    cryptsetup close {{ luks_name }} 2>/dev/null || true
+    wipefs -a {{ part_prefix }}1 {{ part_prefix }}2 {{ part_prefix }}3 2>/dev/null || true
+  changed_when: true
+
+- name: Optional — overwrite entire disk with random data (slow)
+  ansible.builtin.command: >-
+    dd if=/dev/urandom of={{ target_disk }} bs=16M oflag=direct status=none
+  when: prefill_random | bool
+  register: prefill
+  changed_when: true
+  failed_when:
+    - prefill.rc != 0
+    - "'No space left on device' not in prefill.stderr"
+
+- name: Wipe all filesystem/RAID/partition-table signatures on the disk
+  ansible.builtin.command: wipefs -a {{ target_disk }}
+  changed_when: true
+
+- name: "GPT p1 — EFI System Partition ({{ esp_size_mib }} MiB, start 1 MiB)"
+  community.general.parted:
+    device: "{{ target_disk }}"
+    label: gpt
+    number: 1
+    state: present
+    name: ESP
+    part_start: "1MiB"
+    part_end: "{{ 1 + esp_size_mib }}MiB"
+    flags: [esp]
+
+- name: "GPT p2 — /boot ({{ boot_size_mib }} MiB)"
+  community.general.parted:
+    device: "{{ target_disk }}"
+    label: gpt
+    number: 2
+    state: present
+    name: boot
+    part_start: "{{ 1 + esp_size_mib }}MiB"
+    part_end: "{{ 1 + esp_size_mib + boot_size_mib }}MiB"
+
+- name: "GPT p3 — LUKS container (rest of disk)"
+  community.general.parted:
+    device: "{{ target_disk }}"
+    label: gpt
+    number: 3
+    state: present
+    name: luks
+    part_start: "{{ 1 + esp_size_mib + boot_size_mib }}MiB"
+    part_end: "100%"
+
+- name: Settle udev so partition nodes exist
+  ansible.builtin.command: udevadm settle
+  changed_when: false
+
+- name: Read logical sector size (512e vs 4Kn drives)
+  ansible.builtin.command: blockdev --getss {{ target_disk }}
+  register: sector_size
+  changed_when: false
+
+- name: Compute sectors-per-MiB
+  ansible.builtin.set_fact:
+    spm: "{{ 1048576 // (sector_size.stdout | trim | int) }}"
+
+- name: Verify clean MiB-aligned start sectors (fdisk sanity)
+  ansible.builtin.shell: |
+    set -o pipefail
+    sfdisk -d {{ target_disk }} | awk '/start=/{gsub(",","");print $4}'
+  args:
+    executable: /bin/bash
+  register: part_starts
+  changed_when: false
+
+- name: Assert start sectors sit on exact MiB boundaries per the map
+  ansible.builtin.assert:
+    that:
+      - part_starts.stdout_lines[0] | int == 1 * spm | int
+      - part_starts.stdout_lines[1] | int == (1 + esp_size_mib) * spm | int
+      - part_starts.stdout_lines[2] | int == (1 + esp_size_mib + boot_size_mib) * spm | int
+    fail_msg: "Partition starts not MiB-clean: {{ part_starts.stdout_lines }} (sector size {{ sector_size.stdout }})"

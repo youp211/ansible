@@ -1,0 +1,50 @@
+---
+# - name: Preserve the target's original resolv.conf (once)
+#  ansible.builtin.command: >-
+#    cp -a {{ target_mount }}/etc/resolv.conf {{ target_mount }}/etc/resolv.conf.pre-fde
+#  args:
+#    creates: "{{ target_mount }}/etc/resolv.conf.pre-fde"
+#  failed_when: false
+#  when: target_mount != '/'
+
+# - name: Give the chroot working DNS (copy of the live session's resolv.conf)
+#  ansible.builtin.shell: |
+#    set -e
+#    rm -f {{ target_mount }}/etc/resolv.conf
+#    cp -L /etc/resolv.conf {{ target_mount }}/etc/resolv.conf
+#  changed_when: true
+#  when: target_mount != '/'
+
+- name: Refresh the apt index inside the target
+  ansible.builtin.command: chroot {{ target_mount }} apt-get update
+  changed_when: false
+
+- name: Install FDE/fscrypt/TPM tooling into the target
+  ansible.builtin.command: >-
+    chroot {{ target_mount }} env DEBIAN_FRONTEND=noninteractive
+    apt-get install -y {{ (target_packages + (target_packages_pam if fscrypt_install_pam | bool else [])) | join(' ') }}
+  register: tgt_apt
+  changed_when: "'0 newly installed' not in tgt_apt.stdout"
+
+- name: Install convenience packages into the target (non-fatal)
+  ansible.builtin.command: >-
+    chroot {{ target_mount }} env DEBIAN_FRONTEND=noninteractive
+    apt-get install -y {{ target_packages_extra | join(' ') }}
+  register: extra_apt
+  failed_when: false
+  changed_when:
+    - extra_apt.rc == 0
+    - "'0 newly installed' not in extra_apt.stdout"
+  when: target_packages_extra | length > 0
+
+- name: Report convenience package failures without aborting
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: convenience packages ({{ target_packages_extra | join(', ') }})
+      did not install cleanly (rc={{ extra_apt.rc }}). The FDE configuration is
+      unaffected; install them by hand after boot.
+      Last line: {{ (extra_apt.stderr_lines | default([]) | last)
+                    | default('see apt output', true) }}
+  when:
+    - target_packages_extra | length > 0
+    - extra_apt.rc | default(0) != 0

@@ -1,0 +1,3 @@
+# managed by lmde7-fde finalize
+# <target name> <source device>            <key file> <options>
+{{ luks_name }} UUID={{ uuid_map['luks'] }} none luks,tries=3{{ ',discard' if luks_allow_discards | bool else '' }}

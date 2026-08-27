@@ -1,0 +1,5 @@
+ sudo ansible-playbook aide.yml -e target_mount=/
+
+  Add -e aide_init_mode=now if you want the baseline taken during the run
+  instead of at next boot (it takes a few minutes).
+

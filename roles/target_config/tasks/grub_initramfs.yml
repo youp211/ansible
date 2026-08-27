@@ -1,0 +1,54 @@
+---
+- name: Restrict initramfs permissions (UMASK=0077)
+  ansible.builtin.copy:
+    dest: "{{ target_mount }}/etc/initramfs-tools/conf.d/umask"
+    content: "UMASK=0077\n"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Ensure TPM kernel modules are available in the initramfs
+  ansible.builtin.blockinfile:
+    path: "{{ target_mount }}/etc/initramfs-tools/modules"
+    create: true
+    mode: "0644"
+    marker: "# {mark} lmde7-fde tpm"
+    block: |
+      tpm
+      tpm_crb
+      tpm_tis
+  when: tpm2_enroll | bool
+
+- name: Wire hibernation resume device into the initramfs
+  ansible.builtin.copy:
+    dest: "{{ target_mount }}/etc/initramfs-tools/conf.d/resume"
+    content: "RESUME={{ swap_mapper }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+  when: hibernate_enabled | bool
+
+- name: Ensure /etc/default/grub.d exists in the target
+  ansible.builtin.file:
+    path: "{{ target_mount }}/etc/default/grub.d"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Drop hardened kernel cmdline + resume= via GRUB drop-in
+  ansible.builtin.template:
+    src: 90-fde-hardening.cfg.j2
+    dest: "{{ target_mount }}/etc/default/grub.d/90-fde-hardening.cfg"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Optional GRUB menu-edit password
+  ansible.builtin.template:
+    src: 01_password.j2
+    dest: "{{ target_mount }}/etc/grub.d/01_password"
+    owner: root
+    group: root
+    mode: "0755"
+  when: grub_password_pbkdf2 | length > 0

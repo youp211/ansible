@@ -1,0 +1,63 @@
+---
+# UKI ONLY — build and sign Unified Kernel Images, and point a firmware boot
+# entry at the newest. Enrols nothing.
+#
+#   ansible-playbook -i inventory/remote.ini uki.yml -e target_mount=/
+#   sudo ansible-playbook uki.yml -e target_mount=/            # this machine
+#
+# This is the "prepare for Secure Boot" step: after it, the machine has signed
+# images it can boot and a boot entry that selects them, but the firmware still
+# trusts only its factory keys, so nothing has changed about how it boots today.
+# Turning Secure Boot on is a separate, deliberate act — and on a machine whose
+# db does not carry your certificate it needs either the MOK enrolled
+# (kernel.yml) or the platform keys replaced (secureboot.yml).
+#
+# NOTE on remote runs: do NOT prefix with sudo. become happens on the target;
+# a local sudo makes ansible use root's SSH identity, which usually has no key
+# for the remote and fails as "unreachable".
+
+- name: "UKI: build and sign, enrol nothing"
+  hosts: live
+  become: true
+
+  pre_tasks:
+    - name: Look for an installed system at the target mount
+      ansible.builtin.stat:
+        path: "{{ target_mount }}/etc/os-release"
+      register: uki_target_os
+
+    - name: Assert the target holds an installed system
+      ansible.builtin.assert:
+        that: uki_target_os.stat.exists
+        fail_msg: "No {{ target_mount }}/etc/os-release — nothing is installed there."
+        success_msg: "Installed system found at {{ target_mount }}."
+
+    - name: Derive the device-mapper names the UKI cmdline needs
+      # roles/target_mount is the canonical site; this playbook deliberately does
+      # not run it (no LUKS prompt, no mounting). Pure function of vg_name.
+      ansible.builtin.set_fact:
+        root_mapper: "/dev/mapper/{{ vg_name | replace('-', '--') }}-root"
+        swap_mapper: "/dev/mapper/{{ vg_name | replace('-', '--') }}-swap"
+
+  roles:
+    # mok generates the signing key ONLY if it is absent, so a key copied from
+    # another machine is reused rather than replaced. It never enrols: that is
+    # kernel.yml's post-task, and it is not wanted here.
+    - config_contract
+    - mok
+    - uki
+
+  post_tasks:
+    - name: Regenerate grub.cfg so the UKI menu entries appear
+      ansible.builtin.command: chroot {{ target_mount }} update-grub
+      changed_when: true
+      when: uki_enabled | bool
+
+    - name: Next steps
+      ansible.builtin.debug:
+        msg:
+          - "Signed UKIs are on the ESP and a firmware entry points at the newest."
+          - "Nothing is enrolled: Secure Boot state and firmware keys are untouched."
+          - "Test BEFORE turning Secure Boot on — boot the UKI from the firmware menu"
+          - "or the 'LMDE UKI' GRUB entry, and confirm the system comes up."
+          - "Only then decide how the firmware should trust it (KERNEL.md / SECUREBOOT.md)."

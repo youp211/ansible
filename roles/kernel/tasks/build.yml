@@ -1,0 +1,79 @@
+---
+- name: Install the kernel build script
+  ansible.builtin.template:
+    src: fde-kernel-build.j2
+    dest: "{{ target_mount }}/usr/local/sbin/fde-kernel-build"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Build, sign and package the kernel (this takes a long time)
+  # No timeout: a from-scratch build on a modest box is comfortably over
+  # Ansible's default expectations, and killing it halfway leaves a part-built
+  # tree that the next run would have to redo anyway.
+  ansible.builtin.command: chroot {{ target_mount }} /usr/local/sbin/fde-kernel-build
+  register: kernel_build
+  changed_when: true
+
+- name: Show the build tail
+  ansible.builtin.debug:
+    msg: "{{ kernel_build.stdout_lines[-25:] }}"
+
+- name: Find the packages that were produced
+  ansible.builtin.find:
+    paths: "{{ target_mount }}{{ kernel_build_dir }}/out"
+    patterns: "*.deb"
+  register: kernel_debs
+
+- name: Assert the build actually produced packages
+  ansible.builtin.assert:
+    that: kernel_debs.matched > 0
+    fail_msg: >-
+      fde-kernel-build reported success but left no .deb in
+      {{ kernel_build_dir }}/out. Read the build output above; the usual causes
+      are a seed config that fails olddefconfig, or a full filesystem that the
+      preflight free-space check did not predict.
+    success_msg: "{{ kernel_debs.matched }} package(s) built."
+
+- name: Verify the kernel image carries a MOK signature
+  # The one check worth making before installing: a kernel that silently failed
+  # to sign boots fine today and fails the day Secure Boot goes on.
+  ansible.builtin.shell: |
+    set -o pipefail
+    rc=0
+    for deb in {{ target_mount }}{{ kernel_build_dir }}/out/linux-image-*.deb; do
+      case "$deb" in *-dbg_*) continue ;; esac
+      tmp="$(mktemp -d -p {{ target_mount }}{{ kernel_build_dir }})"
+      dpkg-deb --fsys-tarfile "$deb" | tar x -C "$tmp" ./boot 2>/dev/null || true
+      img="$(find "$tmp/boot" -maxdepth 1 -name 'vmlinuz-*' -type f -print -quit)"
+      if [ -z "$img" ]; then echo "== $(basename "$deb"): no vmlinuz"; rc=1
+      elif chroot {{ target_mount }} sbverify --cert {{ mok_cert }} "${img#{{ target_mount }}}" >/dev/null 2>&1; then
+        echo "== $(basename "$deb"): signed by the MOK"
+      else
+        echo "== $(basename "$deb"): NOT signed by the MOK"; rc=1
+      fi
+      rm -rf "$tmp"
+    done
+    exit $rc
+  args:
+    executable: /bin/bash
+  register: kernel_sigcheck
+  changed_when: false
+  failed_when: false
+  when: kernel_sign_image | bool
+
+- name: Show the signature check
+  ansible.builtin.debug:
+    msg: "{{ kernel_sigcheck.stdout_lines }}"
+  when: kernel_sign_image | bool
+
+- name: Assert the kernel image is signed
+  ansible.builtin.assert:
+    that: kernel_sigcheck.rc == 0
+    fail_msg: >-
+      The built kernel image is not signed by {{ mok_cert }}. Under Secure Boot
+      shim would refuse it. Check that sbsigntool installed and that the MOK
+      exists at {{ mok_key }}; set kernel_sign_image=false to install an
+      unsigned kernel anyway (only sensible with Secure Boot off).
+    success_msg: "Kernel image carries a MOK signature."
+  when: kernel_sign_image | bool

@@ -1,0 +1,53 @@
+---
+# .ansible-lint — deliberate opt-outs for lmde7-fde
+#
+# The point of this file is to make `ansible-lint` a REGRESSION DETECTOR. With
+# these five rules left on, a run reports 75 findings that are all intentional,
+# and a genuine new problem lands in the noise. Everything skipped below is a
+# style rule this project disagrees with for a stated reason — nothing here
+# silences a correctness rule, and none of it changes playbook behaviour.
+#
+# Re-check the list when adding a role: if a skip stops being justified, delete
+# it rather than growing the file.
+
+exclude_paths:
+  # Fallout from a brace-expansion mkdir that ran without brace expansion.
+  # Inert, and documented as such in CLAUDE.md.
+  - "{inventory,group_vars,roles"
+
+skip_list:
+  # var-naming[no-role-prefix] — "prefix role variables with the role name".
+  # The rule assumes registered vars and set_facts are role-LOCAL. In this tree
+  # the significant ones are deliberately cross-role: roles/target_mount derives
+  # part_prefix (consumed by 8 files: preflight, partition, filesystems, luks,
+  # tpm2_enroll, target_config, mount-for-installer) and swap_mapper (consumed
+  # by 6, including finalize.yml and two templates). Renaming them
+  # target_mount_* would assert an ownership that is not real, and would have to
+  # be applied atomically across the whole tree to avoid silent breakage.
+  - var-naming[no-role-prefix]
+
+  # name[template] — "Jinja only at the end of a task name".
+  # Task names here are imperative sentences that say WHY (see CLAUDE.md
+  # "Style"), and the interesting value is usually mid-sentence:
+  #   "Mount root LV at {{ target_mount }}"
+  #   "Enroll TPM2 with PIN (PCRs {{ tpm2_pcrs }}); recovery passphrase stays in slot 0"
+  # The compliant reordering makes every one of them read worse.
+  - name[template]
+
+  # yaml[commas] / yaml[line-length] — both land on the same construct: the
+  # `lvs` list in group_vars/all.yml, which is a column-aligned table of inline
+  # dicts. The alignment is what makes eight LV definitions comparable at a
+  # glance; normalising the spacing would destroy it to satisfy a formatter.
+  - yaml[commas]
+  - yaml[line-length]
+
+  # command-instead-of-module — three cases, each chosen for semantics the
+  # module does not expose:
+  #   rsync -aHAXS   : hardlinks, ACLs, xattrs and sparse files must ALL survive
+  #                    the LV migration; ansible.posix.synchronize does not
+  #                    surface that flag set.
+  #   mount -t ext4  : assembling a chroot at {{ target_mount }}, not managing
+  #                    the running system's fstab.
+  #   mount --bind   : specifically NOT --rbind — /run/user/* is useless in a
+  #                    chroot and busy at teardown. The comment is inline.
+  - command-instead-of-module

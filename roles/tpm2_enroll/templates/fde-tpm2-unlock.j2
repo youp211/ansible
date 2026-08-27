@@ -1,0 +1,94 @@
+#!/bin/sh
+# managed by lmde7-fde — TPM2+PIN unlock for the root LUKS2 container
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# initramfs-tools' cryptroot unlocks via unlock_mapping() in
+# /lib/cryptsetup/functions, which always passes --key-file and never passes
+# --token-only/--token-type/--token-id. Per cryptsetup-open(8) a LUKS2 token
+# protected by a PIN is not tried unless one of those is given, so a
+# systemd-cryptenroll --tpm2-with-pin token is never attempted at boot.
+# This script performs that unlock; cryptroot's setup_mapping() then sees the
+# mapping already exists and skips the device.
+#
+# HOW THE PIN IS COLLECTED (this matters — an earlier version broke boot)
+# ----------------------------------------------------------------------
+# cryptsetup's tools_get_key() reads the token PIN from the TERMINAL only when
+# stdin is a tty; otherwise it reads it from stdin as data. Handing cryptsetup
+# /dev/console directly is therefore unsafe: in local-top it is not a tty, so
+# cryptsetup reads EOF ("Nothing to read on input") and the console is left in
+# a state where cryptroot's own prompt also fails — an unbootable system.
+# Instead we collect the PIN with /lib/cryptsetup/askpass (the same helper
+# cryptroot uses; already in the initramfs, and plymouth-aware) and pipe it in.
+# cryptsetup then sees a pipe on stdin and reads the PIN as data. This script
+# never reads the console itself.
+#
+# Every failure path exits 0 without creating a mapping, leaving cryptroot to
+# prompt for the passphrase exactly as if this file did not exist.
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+  prereqs) prereqs; exit 0 ;;
+esac
+
+{% if tpm2_boot_unlock == 'cmdline' %}
+# SAFE-TEST MODE (tpm2_boot_unlock: cmdline): do nothing unless "fde_tpm2"
+# appears on the kernel cmdline. Press "e" in GRUB and append it to test; a
+# plain reboot is then unaffected.
+grep -qw 'fde_tpm2' /proc/cmdline || exit 0
+{% endif %}
+
+NAME="{{ luks_name }}"
+UUID="{{ tpm2_luks_blkid.stdout | trim }}"
+TRIES="{{ tpm2_boot_tries }}"
+
+# Already unlocked, or missing tooling: nothing to do.
+[ -e "/dev/mapper/$NAME" ] && exit 0
+command -v cryptsetup >/dev/null 2>&1 || exit 0
+[ -x /lib/cryptsetup/askpass ] || exit 0
+
+# Wait briefly for the TPM resource-manager node (tpm/tpm_crb/tpm_tis come from
+# /etc/initramfs-tools/modules; udev has already run by local-top).
+i=0
+while [ ! -e /dev/tpmrm0 ] && [ "$i" -lt 25 ]; do
+  sleep 0.2
+  i=$((i + 1))
+done
+[ -e /dev/tpmrm0 ] || exit 0
+
+# Resolve the container exactly as cryptroot does.
+i=0
+SRC=""
+while [ "$i" -lt 50 ]; do
+  SRC="$(blkid -l -t "UUID=$UUID" -o device 2>/dev/null)" || SRC=""
+  [ -b "$SRC" ] && break
+  SRC=""
+  sleep 0.2
+  i=$((i + 1))
+done
+[ -n "$SRC" ] || exit 0
+
+# Only prompt if a systemd-tpm2 token is actually present in the header.
+cryptsetup luksDump "$SRC" 2>/dev/null | grep -q 'systemd-tpm2' || exit 0
+
+i=0
+while [ "$i" -lt "$TRIES" ]; do
+  i=$((i + 1))
+  PIN="$(/lib/cryptsetup/askpass "TPM2 PIN for $NAME (empty to use passphrase): ")" || exit 0
+  # Empty input is the deliberate escape hatch: fall through to cryptroot.
+  [ -n "$PIN" ] || exit 0
+
+  if printf '%s\n' "$PIN" | cryptsetup open \
+        --token-only \
+        --token-type systemd-tpm2 \
+        -- "$SRC" "$NAME"; then
+    PIN=""
+    echo "$NAME: unlocked via TPM2"
+    exit 0
+  fi
+  PIN=""
+  echo "$NAME: TPM2 unlock failed ($i/$TRIES)"
+done
+
+exit 0

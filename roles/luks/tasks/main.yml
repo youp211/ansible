@@ -1,0 +1,38 @@
+---
+- name: Format {{ part_prefix }}3 as LUKS2 (argon2id, {{ luks_sector_size }}-byte sectors) and open it
+  community.crypto.luks_device:
+    device: "{{ part_prefix }}3"
+    state: opened
+    name: "{{ luks_name }}"
+    type: luks2
+    label: "{{ luks_name }}"
+    passphrase: "{{ luks_passphrase }}"
+    cipher: "{{ luks_cipher }}"
+    keysize: "{{ luks_key_size }}"
+    hash: sha512
+    sector_size: "{{ luks_sector_size }}"
+    pbkdf:
+      algorithm: "{{ luks_pbkdf_algorithm }}"
+      memory: "{{ luks_pbkdf_memory_kib }}"
+      iteration_time: "{{ luks_pbkdf_time_s }}"
+    allow_discards: "{{ luks_allow_discards }}"
+  no_log: true
+
+- name: Capture LUKS container UUID for crypttab
+  ansible.builtin.command: blkid -s UUID -o value {{ part_prefix }}3
+  register: luks_uuid_out
+  changed_when: false
+
+- name: Record LUKS UUID fact
+  ansible.builtin.set_fact:
+    luks_uuid: "{{ luks_uuid_out.stdout | trim }}"
+
+- name: Show container summary (header only, no secrets)
+  ansible.builtin.command: cryptsetup luksDump {{ part_prefix }}3
+  register: luks_dump
+  changed_when: false
+
+- name: Assert argon2id landed in keyslot 0
+  ansible.builtin.assert:
+    that: "'argon2id' in luks_dump.stdout"
+    fail_msg: "luksDump does not show argon2id — check community.crypto version."

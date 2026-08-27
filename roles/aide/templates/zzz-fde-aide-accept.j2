@@ -1,0 +1,17 @@
+#!/bin/sh
+# managed by lmde7-fde (roles/aide)
+#
+# Run from /etc/kernel/{postinst,postrm}.d and /etc/initramfs/post-update.d.
+# Sorted last on purpose: zz-update-grub has to have written the new grub.cfg
+# before the baseline is taken. Never fails the calling hook — a package
+# upgrade must not break because a file integrity database could not be
+# refreshed.
+set -u
+
+[ -x /usr/local/sbin/fde-aide-boot-accept ] || exit 0
+[ -f /var/lib/aide/aide.db ] || exit 0
+
+/usr/local/sbin/fde-aide-boot-accept || \
+    printf 'zzz-fde-aide-accept: re-baselining the boot chain failed; run\n%s\nby hand once the system is settled\n' \
+        '  sudo /usr/local/sbin/fde-aide-boot-accept' >&2
+exit 0

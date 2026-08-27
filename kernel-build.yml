@@ -1,0 +1,114 @@
+---
+# KERNEL BUILD ONLY — compile an upstream kernel, sign it with the MOK, install it.
+#
+#   sudo ansible-playbook kernel-build.yml -e target_mount=/
+#   sudo ansible-playbook kernel-build.yml -e target_mount=/ -e kernel_version=6.12.30
+#   sudo ansible-playbook kernel-build.yml -e target_mount=/ -e kernel_localversion=-fde
+#
+# Running this playbook IS the request to build, so it deliberately ignores
+# kernel_build_enabled — that flag exists so kernel.yml (MOK, enrollment, repo)
+# can be re-run without triggering a forty-minute compile. Everything else still
+# comes from group_vars: kernel_version, kernel_build_dir, kernel_sign_image,
+# kernel_sign_modules, kernel_debug_info, kernel_install, kernel_keep_all.
+#
+# The signing key is whatever is at mok_key/mok_cert: yours if you put it there,
+# generated on the spot if not. See KERNEL.md "Providing your own key instead".
+#
+# Adapted from ~/git/scripts/kernel/{build-latest-kernel,make-kernel-deb}.sh —
+# same kernel.org fetch and sha256 verification, same seed-config + olddefconfig,
+# same `make bindeb-pkg`. What this adds is MOK signing of both the image and the
+# modules, and a build directory that is neither noexec nor too small.
+#
+# BEFORE THE FIRST RUN, read KERNEL.md: it needs tens of GiB on a filesystem
+# this project's own CIS fstab does not mount noexec.
+
+- name: "Kernel: compile, sign and install"
+  hosts: live
+  become: true
+
+  pre_tasks:
+    - name: Look for an installed system at the target mount
+      ansible.builtin.stat:
+        path: "{{ target_mount }}/etc/os-release"
+      register: kbuild_target_os
+
+    - name: Assert the target holds an installed system
+      ansible.builtin.assert:
+        that: kbuild_target_os.stat.exists
+        fail_msg: >-
+          No {{ target_mount }}/etc/os-release — nothing is installed there.
+          On the booted system run this with -e target_mount=/ .
+        success_msg: "Installed system found at {{ target_mount }}."
+
+  roles:
+    # Generates the signing key only if mok_key does not already exist, and
+    # never enrolls: a build does not need the MOK in firmware, only on disk.
+    - config_contract
+    - mok
+
+  tasks:
+    - name: Preflight — build directory, free space, signing prerequisites
+      ansible.builtin.include_role:
+        name: kernel
+        tasks_from: preflight.yml
+
+    - name: Install the kernel build toolchain
+      ansible.builtin.include_role:
+        name: kernel
+        tasks_from: packages.yml
+
+    - name: Build, sign and package
+      ansible.builtin.include_role:
+        name: kernel
+        tasks_from: build.yml
+
+    - name: Install the built packages
+      ansible.builtin.include_role:
+        name: kernel
+        tasks_from: install.yml
+      when: kernel_install | bool
+
+    - name: Publish to the apt repo (server mode)
+      ansible.builtin.include_role:
+        name: kernel
+        tasks_from: publish.yml
+      when: kernel_repo_publish | bool
+
+  post_tasks:
+    - name: Warn that the TPM2 seal is now stale
+      # The dependency is real but cannot be satisfied in this run. A direct
+      # PCR 11 binding seals against the CURRENTLY RUNNING image, and the image
+      # that will boot next is the one just built — so the seal has to be taken
+      # AFTER rebooting into it. Predicting the new PCR 11 with
+      # "systemd-measure calculate" and enrolling 11:sha256=<predicted> would
+      # collapse this to one step, but the prediction did not reproduce the
+      # observed PCR 11 on this hardware, and enrolling an unverified digest
+      # produces a keyslot that silently never unseals.
+      ansible.builtin.debug:
+        msg:
+          - "==================================================================="
+          - "  TPM2 SEAL IS NOW STALE"
+          - "==================================================================="
+          - >-
+            tpm2_pcrs="{{ tpm2_pcrs }}" binds directly to PCR 11, which measures
+            the running UKI. A new kernel means a new UKI and a new PCR 11, so
+            the current keyslot will NOT unseal at the next boot.
+          - "Expect the recovery passphrase once, then re-seal:"
+          - "  1. reboot (pick the new kernel)"
+          - "  2. sudo ansible-playbook tpm2.yml -e target_mount=/"
+          - "tpm2.yml refuses unless you are booted from the newest UKI, so it"
+          - "cannot be run too early by mistake."
+      when:
+        - tpm2_pcrs is search('11')
+        - kernel_install | bool
+
+    - name: Next steps
+      ansible.builtin.debug:
+        msg:
+          - >-
+            {{ 'Kernel built, signed with ' ~ mok_cert ~ ' and installed.'
+            if kernel_install | bool
+            else 'Kernel built and signed; packages left in ' ~ kernel_build_dir ~ '/out.' }}
+          - "Reboot and pick it from the GRUB menu; the previous kernel stays as the fallback."
+          - "Under Secure Boot it needs the MOK enrolled — kernel.yml stages that."
+          - "Verification checklist: VERIFY.md section 13."

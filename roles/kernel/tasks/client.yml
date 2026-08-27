@@ -1,0 +1,57 @@
+---
+# CLIENT MODE — subscribe this machine to the repo the publisher fills. Wholly
+# independent of the build: the machine that builds need not be one that
+# installs, and this half is what makes "dist over the repo" mean anything.
+
+- name: Config contract — client mode needs a URL and a public key
+  # An empty key is refused rather than defaulted to trusted=yes. A repo apt
+  # trusts unconditionally is a repo that can ship this machine an unsigned
+  # kernel, which would undo the MOK and the signing above in one line.
+  ansible.builtin.assert:
+    that:
+      - kernel_repo_url | length > 0
+      - kernel_repo_suite | length > 0
+      - kernel_repo_gpg_key | length > 0
+    fail_msg: >-
+      kernel_repo_client=true needs kernel_repo_url, kernel_repo_suite and
+      kernel_repo_gpg_key (the repo's ASCII-armoured PUBLIC key). There is a
+      worked example in group_vars/all.yml. This is deliberately not optional —
+      the alternative would be adding the repo trusted=yes, i.e. letting it ship
+      an unsigned kernel.
+    success_msg: "Client will pull from {{ kernel_repo_url }} ({{ kernel_repo_suite }})."
+
+- name: Ensure the apt keyring directory exists
+  ansible.builtin.file:
+    path: "{{ target_mount }}/etc/apt/keyrings"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the repo's signing public key
+  ansible.builtin.copy:
+    dest: "{{ target_mount }}/etc/apt/keyrings/lmde7-fde-kernel.asc"
+    content: "{{ kernel_repo_gpg_key }}\n"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install the deb822 apt source
+  ansible.builtin.template:
+    src: kernel-repo.sources.j2
+    dest: "{{ target_mount }}/etc/apt/sources.list.d/lmde7-fde-kernel.sources"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Refresh apt against the new source
+  ansible.builtin.command: chroot {{ target_mount }} apt-get update
+  register: kernel_client_update
+  changed_when: false
+
+- name: Client subscription result
+  ansible.builtin.debug:
+    msg:
+      - "Subscribed to {{ kernel_repo_url }} ({{ kernel_repo_suite }}/{{ kernel_repo_components }})."
+      - "Key: /etc/apt/keyrings/lmde7-fde-kernel.asc (Signed-By, not trusted=yes)."
+      - "Install a kernel from it with: apt-get install linux-image-<version>"

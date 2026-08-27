@@ -1,0 +1,9 @@
+#!/bin/sh
+# enroll-sb — one short command for the Secure Boot enrolment, because the
+# full ansible-playbook invocation wraps in a narrow terminal and a wrapped
+# "-e" silently loses its argument.
+#
+# secureboot.yml is inherently a booted-system playbook: it reads
+# /sys/firmware/efi and writes live firmware variables, so target_mount is
+# always "/" here. Everything else comes from group_vars/all.yml.
+exec sudo ansible-playbook "$(dirname "$0")/secureboot.yml" -e target_mount=/ "$@"

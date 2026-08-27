@@ -1,0 +1,163 @@
+---
+- name: Assert required variables are set
+  ansible.builtin.assert:
+    that:
+      - target_disk | length > 0
+      - target_disk is match('^/dev/')
+      - expected_disk_size_gib | int > 0
+      - confirm_disk_wipe | bool
+    fail_msg: >-
+      Set target_disk, expected_disk_size_gib and confirm_disk_wipe=true in
+      group_vars/all.yml. This playbook DESTROYS the target disk; the
+      interlock is deliberate.
+
+- name: Assert running as root
+  ansible.builtin.assert:
+    that: ansible_facts.user_uid == 0
+    fail_msg: "Run with sudo/become (root required)."
+
+- name: Assert UEFI boot environment
+  ansible.builtin.stat:
+    path: /sys/firmware/efi
+  register: efi_dir
+
+- name: Fail if not UEFI
+  ansible.builtin.assert:
+    that: efi_dir.stat.exists
+    fail_msg: "Live session is not UEFI-booted; this layout (ESP + GRUB EFI + UKI) requires UEFI."
+
+- name: Install required packages into the live session
+  ansible.builtin.apt:
+    name: "{{ live_packages }}"
+    state: present
+    update_cache: true
+
+- name: Compute partition name prefix (nvme0n1 -> nvme0n1p1, sda -> sda1)
+  ansible.builtin.set_fact:
+    part_prefix: "{{ target_disk }}{{ 'p' if (target_disk | basename) is match('.*[0-9]$') else '' }}"
+
+- name: Read target disk size in bytes
+  ansible.builtin.command: lsblk -bdno SIZE {{ target_disk }}
+  register: disk_size_bytes
+  changed_when: false
+
+- name: Interlock — disk size must match expectation exactly (floor GiB)
+  ansible.builtin.assert:
+    that:
+      - (disk_size_bytes.stdout | trim | int) // 1073741824 == expected_disk_size_gib | int
+    fail_msg: >-
+      {{ target_disk }} is
+      {{ (disk_size_bytes.stdout | trim | int) // 1073741824 }} GiB but
+      expected_disk_size_gib={{ expected_disk_size_gib }}. Refusing to touch it.
+
+- name: Interlock — target disk (or its children) must not be mounted
+  ansible.builtin.shell: |
+    set -o pipefail
+    lsblk -no MOUNTPOINTS {{ target_disk }} | grep -v '^$' || true
+  args:
+    executable: /bin/bash
+  register: disk_mounts
+  changed_when: false
+
+- name: Fail if anything on the disk is mounted
+  ansible.builtin.assert:
+    that: disk_mounts.stdout | trim | length == 0
+    fail_msg: "Something on {{ target_disk }} is mounted: {{ disk_mounts.stdout_lines }}. Unmount first."
+
+- name: Interlock — enforce minimum disk size ({{ min_disk_size_gib }} GiB)
+  ansible.builtin.assert:
+    that: expected_disk_size_gib | int >= min_disk_size_gib | int
+    fail_msg: >-
+      Disk is {{ expected_disk_size_gib }} GiB; this layout requires at least
+      {{ min_disk_size_gib }} GiB (min_disk_size_gib).
+
+- name: Validate swap_size_mode
+  ansible.builtin.assert:
+    that: swap_size_mode in ['fixed', 'ram']
+    fail_msg: "swap_size_mode must be 'fixed' or 'ram', got '{{ swap_size_mode }}'."
+
+- name: Detect exact physical RAM (lsmem total online bytes)
+  ansible.builtin.shell: |
+    set -o pipefail
+    lsmem -b --summary=only | awk '/Total online memory/{print $4}'
+  args:
+    executable: /bin/bash
+  register: ram_probe
+  changed_when: false
+
+- name: Record RAM size
+  ansible.builtin.set_fact:
+    ram_bytes: "{{ ram_probe.stdout | trim | int }}"
+
+- name: Sanity — RAM detection produced a value
+  ansible.builtin.assert:
+    that: ram_bytes | int > 0
+    fail_msg: "Could not read total online memory from lsmem."
+
+- name: Compute effective swap size ({{ swap_size_mode }} mode)
+  ansible.builtin.set_fact:
+    swap_size_mib: >-
+      {{ ((ram_bytes | int) * (swap_ram_multiplier | float) / 1048576)
+         | round(0, 'ceil') | int
+         if swap_size_mode == 'ram'
+         else ((_sw | regex_replace('g$', '') | int) * 1024
+               if _sw is match('^[0-9]+g$')
+               else _sw | regex_replace('m$', '') | int) }}
+  vars:
+    _sw: "{{ (lvs | selectattr('name', 'equalto', 'swap') | first).size }}"
+
+- name: Hibernation requires swap >= physical RAM
+  ansible.builtin.assert:
+    that: (swap_size_mib | int) * 1048576 >= ram_bytes | int
+    fail_msg: >-
+      hibernate_enabled=true but swap ({{ swap_size_mib }} MiB) is smaller than
+      RAM ({{ (ram_bytes | int) // 1048576 }} MiB). Raise swap_ram_multiplier
+      to >= 1 or disable hibernation.
+  when: hibernate_enabled | bool
+
+- name: Sum fixed LV sizes excluding swap and home (MiB)
+  ansible.builtin.set_fact:
+    fixed_lv_mib: >-
+      {{ (fixed_lv_mib | default(0) | int)
+         + ((item.size | regex_replace('g$', '') | int) * 1024
+            if item.size is match('^[0-9]+g$')
+            else item.size | regex_replace('m$', '') | int) }}
+  loop: "{{ lvs | rejectattr('name', 'in', ['swap', 'home']) | list }}"
+  loop_control:
+    label: "{{ item.name }} {{ item.size }}"
+
+- name: Fit-check — layout must leave at least 64 GiB for /home
+  ansible.builtin.set_fact:
+    home_remaining_mib: >-
+      {{ (expected_disk_size_gib | int) * 1024
+         - esp_size_mib - boot_size_mib - 1024
+         - (fixed_lv_mib | int) - (swap_size_mib | int) }}
+
+- name: Assert the map fits
+  ansible.builtin.assert:
+    that: home_remaining_mib | int >= 65536
+    fail_msg: >-
+      Fixed LVs ({{ fixed_lv_mib }} MiB) + swap ({{ swap_size_mib }} MiB) +
+      ESP/boot/overhead leave only {{ home_remaining_mib }} MiB for /home
+      (< 64 GiB). Shrink the lvs sizes or the swap multiplier.
+
+- name: Sizing summary
+  ansible.builtin.debug:
+    msg: >-
+      RAM {{ (ram_bytes | int) // 1048576 }} MiB ->
+      swap {{ swap_size_mib }} MiB ({{ swap_size_mode }}
+      {{ 'x' ~ swap_ram_multiplier if swap_size_mode == 'ram' else '' }});
+      fixed LVs {{ fixed_lv_mib }} MiB; ~{{ (home_remaining_mib | int) // 1024 }}
+      GiB headroom for /home (95%FREE of it after LVM metadata).
+
+- name: Warn (not fail) if no TPM2 device is visible from the live session
+  ansible.builtin.stat:
+    path: /dev/tpmrm0
+  register: tpmrm
+
+- name: TPM presence note
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'TPM2 device present at /dev/tpmrm0.' if tpmrm.stat.exists else
+         'WARNING: no /dev/tpmrm0 — finalize TPM2 enrollment will fail unless
+          the TPM is enabled in firmware. Passphrase-only boot still works.' }}

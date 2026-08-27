@@ -1,0 +1,69 @@
+---
+- name: Install the baseline unit (self-skipping once a database exists)
+  ansible.builtin.template:
+    src: fde-aide-init.service.j2
+    dest: "{{ target_mount }}/etc/systemd/system/fde-aide-init.service"
+    owner: root
+    group: root
+    mode: "0644"
+  when: aide_init_mode != 'never'
+
+- name: Enable the baseline unit
+  ansible.builtin.command: >-
+    chroot {{ target_mount }} systemctl enable fde-aide-init.service
+  register: aide_init_unit
+  changed_when: "'Created symlink' in (aide_init_unit.stderr + aide_init_unit.stdout)"
+  when: aide_init_mode != 'never'
+
+- name: "Remove the baseline unit (aide_init_mode: never)"
+  when: aide_init_mode == 'never'
+  block:
+    - name: Disable the baseline unit
+      ansible.builtin.command: chroot {{ target_mount }} systemctl disable fde-aide-init.service
+      register: aide_init_disable
+      failed_when: false
+      changed_when: "'Removed' in (aide_init_disable.stderr + aide_init_disable.stdout)"
+
+    - name: Delete the baseline unit
+      ansible.builtin.file:
+        path: "{{ target_mount }}/etc/systemd/system/fde-aide-init.service"
+        state: absent
+
+    - name: No baseline will be taken
+      ansible.builtin.debug:
+        msg: >-
+          aide_init_mode=never — AIDE is configured but has no database. Nothing
+          will be checked until you run "sudo aideinit -y -f" on the target.
+
+- name: Make the new units visible to a running systemd
+  ansible.builtin.command: chroot {{ target_mount }} systemctl daemon-reload
+  changed_when: true
+  when: target_mount == '/'
+
+- name: "Take the AIDE baseline now (aide_init_mode: now)"
+  # Minutes, not seconds: this hashes every file the rules cover. In a chroot it
+  # also hashes whatever is bind-mounted under the target, which is why
+  # firstboot is the default.
+  ansible.builtin.command: chroot {{ target_mount }} aideinit -y -f
+  register: aide_init_now
+  failed_when: false
+  changed_when: aide_init_now.rc == 0
+  when: aide_init_mode == 'now'
+
+- name: Report the baseline result
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'AIDE baseline written to /var/lib/aide/aide.db.' if aide_init_now.rc | default(1) == 0
+      else 'WARNING: aideinit failed (rc=' ~ aide_init_now.rc | default('skipped') ~ '). See
+      /var/log/aide/aideinit.errors in the target; fde-aide-init.service retries
+      at the next boot.' }}
+  when: aide_init_mode == 'now'
+
+- name: AIDE summary
+  ansible.builtin.debug:
+    msg:
+      - "AIDE configured in {{ target_mount }}."
+      - "Baseline: {{ aide_init_mode }}{{ ' (fde-aide-init.service runs at first boot)' if aide_init_mode == 'firstboot' else '' }}"
+      - "Per-boot check of {{ aide_boot_limit }}: {{ 'on' if aide_boot_check | bool else 'off' }} — journalctl -u fde-aide-boot-check -b"
+      - "Daily whole-system check: {{ 'on' if aide_daily_enabled | bool else 'off' }} — /var/log/aide/aide.log"
+      - "After any hand-made boot-chain change: sudo /usr/local/sbin/fde-aide-boot-accept"

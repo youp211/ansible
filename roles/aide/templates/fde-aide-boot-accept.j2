@@ -1,0 +1,46 @@
+#!/bin/sh
+# managed by lmde7-fde (roles/aide)
+#
+# Re-baseline the boot chain after a change you made on purpose (kernel package,
+# update-initramfs, grub-install, update-grub, a finalize.yml rerun).
+#
+# Entries outside the limit are copied from the old database unchanged, so this
+# is not a whole-system accept: only what matches the limit is re-read from disk.
+set -u
+
+CONFIG=/etc/aide/aide.conf
+DB=/var/lib/aide/aide.db
+NEWDB=/var/lib/aide/aide.db.fde-accept
+LIMIT='{{ aide_boot_limit }}'
+
+if [ ! -f "$DB" ]; then
+    printf 'no AIDE baseline yet (%s missing) — nothing to accept\n' "$DB"
+    exit 0
+fi
+
+rm -f "$NEWDB"
+
+# --before is parsed ahead of the config file and the FIRST database_out line
+# wins, so this redirects the output without touching aide.db.new — the file the
+# daily check writes and the admin may still be holding for review.
+aide --config="$CONFIG" --before="database_out=file:$NEWDB" \
+     --update --limit "$LIMIT" --no-progress --no-color
+rc=$?
+
+if [ "$rc" -gt 7 ]; then
+    printf 'aide --update failed with status %d; baseline left unchanged\n' "$rc"
+    rm -f "$NEWDB"
+    exit "$rc"
+fi
+
+if [ ! -s "$NEWDB" ]; then
+    printf 'aide wrote no database; baseline left unchanged\n'
+    rm -f "$NEWDB"
+    exit 1
+fi
+
+chown --reference="$DB" "$NEWDB" 2>/dev/null || true
+chmod --reference="$DB" "$NEWDB" 2>/dev/null || true
+mv -f "$NEWDB" "$DB"
+printf 'AIDE baseline for %s accepted\n' "$LIMIT"
+exit 0

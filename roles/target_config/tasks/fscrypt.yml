@@ -1,0 +1,21 @@
+---
+- name: Create the target's /etc/fscrypt.conf (v2 policies, nothing encrypted)
+  ansible.builtin.command: chroot {{ target_mount }} fscrypt setup --quiet --force
+  changed_when: true
+
+- name: Register the /home filesystem with fscrypt inside the target
+  ansible.builtin.command: chroot {{ target_mount }} fscrypt setup /home --quiet
+  register: fscrypt_home
+  changed_when: fscrypt_home.rc == 0
+  failed_when:
+    - fscrypt_home.rc != 0
+    - "'already setup' not in (fscrypt_home.stderr + fscrypt_home.stdout)"
+
+- name: Verify — /home is fscrypt-ready with 0 protectors and 0 policies
+  ansible.builtin.command: chroot {{ target_mount }} fscrypt status /home
+  register: fscrypt_home_stat
+  changed_when: false
+
+- name: Show fscrypt status
+  ansible.builtin.debug:
+    msg: "{{ fscrypt_home_stat.stdout_lines }}"

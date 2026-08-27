@@ -1,0 +1,11 @@
+# managed by lmde7-fde (roles/kernel) — apt source for the self-built kernels
+#
+# deb822 with an explicit Signed-By, and NOT "[trusted=yes]": a repo added
+# trusted=yes is a repo that can hand this machine an unsigned kernel, which
+# would undo the MOK, the signing and the Secure Boot chain in one line.
+Types: deb
+URIs: {{ kernel_repo_url }}
+Suites: {{ kernel_repo_suite }}
+Components: {{ kernel_repo_components }}
+Architectures: amd64
+Signed-By: /etc/apt/keyrings/lmde7-fde-kernel.asc

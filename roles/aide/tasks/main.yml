@@ -1,0 +1,38 @@
+---
+# AIDE — file integrity monitoring for the boot chain and the installed system.
+# See AIDE.md for the threat model this covers (offline tampering with the
+# unencrypted /boot and ESP) and the day-to-day workflow.
+#
+# This role is deliberately incapable of aborting finalize.yml before the boot
+# chain is complete: it is included as the last post_task, and the package
+# install is non-fatal.
+
+- name: AIDE disabled (aide_enabled=false)
+  ansible.builtin.debug:
+    msg: >-
+      aide_enabled=false — no file integrity monitoring is installed. Flip
+      aide_enabled in group_vars/all.yml and re-run finalize.yml (or
+      aide.yml -e target_mount=/ on the booted system) to configure it.
+  when: not aide_enabled | bool
+
+- name: Install AIDE into the target
+  ansible.builtin.import_tasks: packages.yml
+  when: aide_enabled | bool
+
+- name: Rules, wrapper settings, config validation
+  ansible.builtin.import_tasks: config.yml
+  when:
+    - aide_enabled | bool
+    - aide_installed | default(false) | bool
+
+- name: Boot-chain check, accept helper, kernel hooks
+  ansible.builtin.import_tasks: scripts.yml
+  when:
+    - aide_enabled | bool
+    - aide_installed | default(false) | bool
+
+- name: Baseline database
+  ansible.builtin.import_tasks: init.yml
+  when:
+    - aide_enabled | bool
+    - aide_installed | default(false) | bool

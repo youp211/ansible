@@ -1,0 +1,36 @@
+---
+- name: Read back what firmware now holds
+  # Globs, and grep -c rather than grep -q: -c drains its input, so pipefail
+  # cannot trip on a SIGPIPE the way an early-exiting consumer would.
+  ansible.builtin.shell: |
+    set -o pipefail
+    read_var() {
+      for f in /sys/firmware/efi/efivars/"$1"-*; do
+        [ -e "$f" ] || continue
+        od -An -tu1 "$f" | awk '{print $5}'
+        return
+      done
+      echo "?"
+    }
+    echo "SetupMode=$(read_var SetupMode) SecureBoot=$(read_var SecureBoot)"
+    for v in pk kek db; do
+      out="$(mokutil --$v 2>/dev/null || true)"
+      printf '%s=%s cert(s)\n' "$v" "$(printf '%s' "$out" | grep -c 'Subject:' || true)"
+    done
+  args:
+    executable: /bin/bash
+  register: sb_state
+  changed_when: false
+
+- name: Secure Boot summary
+  ansible.builtin.debug:
+    msg:
+      - "{{ sb_state.stdout_lines }}"
+      - >-
+        {{ 'Hierarchy enrolled. Next: enable Secure Boot in firmware, boot the UKI,
+        then re-enrol TPM2 — replacing PK/KEK/db changes PCR 7, so the existing
+        keyslot will not unseal and you will need the recovery passphrase once.'
+        if secureboot_enroll | bool
+        else 'Keys generated and staged; nothing written to firmware. Re-run with
+        secureboot_enroll=true while the firmware is in setup mode to commit.' }}
+      - "Recovery at any point: firmware setup -> Restore factory keys. Nothing here is one-way."

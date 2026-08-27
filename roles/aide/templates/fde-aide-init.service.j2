@@ -1,0 +1,21 @@
+# managed by lmde7-fde (roles/aide)
+[Unit]
+Description=Take the AIDE baseline database (first boot)
+Documentation=file:/usr/share/doc/aide-common/README.Debian.gz
+# Self-skipping: this is a one-shot that becomes a no-op the moment a baseline
+# exists, so it can stay enabled forever.
+ConditionPathExists=!/var/lib/aide/aide.db
+RequiresMountsFor=/var/lib/aide /boot {{ uki_esp_mount }}
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/aideinit -y -f
+# Hashing the filesystem takes minutes; stay out of the way of the desktop
+# session that is starting at the same time.
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=infinity
+
+[Install]
+WantedBy=multi-user.target

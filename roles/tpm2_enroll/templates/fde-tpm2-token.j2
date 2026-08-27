@@ -1,0 +1,36 @@
+#!/bin/sh
+# managed by lmde7-fde finalize
+# Ships the systemd LUKS2 token plugin AND every library systemd dlopen()s for
+# TPM2 support into the initramfs.
+#
+# VERIFIED AGAINST systemd src/shared/tpm2-util.c: dlopen_tpm2() opens
+# libtss2-esys.so.0, libtss2-rc.so.0 and libtss2-mu.so.0. If any of them is
+# missing, dlopen_tpm2() fails and every TPM2 call returns -ENOTSUP, which
+# surfaces at boot as "Could not find TPM2 device: Operation not supported".
+# Because these are dlopen()ed rather than linked, copy_exec's ldd walk does
+# NOT pick them up — they must be copied explicitly. libtss2-tctildr likewise
+# dlopen()s the individual TCTI backends (libtss2-tcti-device).
+PREREQ="cryptroot"
+prereqs() { echo "$PREREQ"; }
+case "$1" in
+  prereqs) prereqs; exit 0 ;;
+esac
+. /usr/share/initramfs-tools/hook-functions
+
+# LUKS2 external token plugins (systemd-tpm2 et al.)
+for so in /usr/lib/*/cryptsetup/libcryptsetup-token-*.so; do
+  [ -e "$so" ] && copy_exec "$so"
+done
+
+# Everything systemd dlopen()s for TPM2, plus the TCTI loader and backend.
+for lib in libtss2-esys libtss2-rc libtss2-mu libtss2-tctildr libtss2-tcti-device; do
+  found=
+  for so in /usr/lib/*/"$lib".so.[0-9]*; do
+    [ -e "$so" ] || continue
+    copy_exec "$so"
+    found=y
+  done
+  [ -n "$found" ] || echo "fde-tpm2-token: WARNING: $lib not found; TPM2 unlock will not work" >&2
+done
+
+exit 0

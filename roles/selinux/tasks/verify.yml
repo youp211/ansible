@@ -1,0 +1,39 @@
+---
+# Informational only. In a live-ISO chroot the running kernel has AppArmor in
+# the LSM slot, so sestatus and check-selinux-installation both report SELinux
+# as disabled — correctly, and not usefully. The real verification is post-boot
+# and lives in VERIFY.md section 12.
+
+- name: Read the target's SELinux status
+  ansible.builtin.command: chroot {{ target_mount }} sestatus
+  register: selinux_sestatus
+  changed_when: false
+  failed_when: false
+
+- name: Run selinux-basics' own installation tests
+  # Prints one line per problem found and nothing at all when clean; the exit
+  # code is always 0, so there is nothing to assert on.
+  ansible.builtin.command: chroot {{ target_mount }} check-selinux-installation
+  register: selinux_check
+  changed_when: false
+  failed_when: false
+
+- name: Show the target's SELinux status
+  ansible.builtin.debug:
+    msg: "{{ (selinux_sestatus.stdout_lines + selinux_check.stdout_lines) | reject('equalto', '') | list }}"
+
+- name: SELinux summary
+  ansible.builtin.debug:
+    msg:
+      - "SELinux configured in {{ target_mount }} — policy '{{ selinux_policy_type }}', mode '{{ selinux_mode }}'."
+      - "Kernel cmdline drop-in: /etc/default/grub.d/91-fde-selinux.cfg -> {{ selinux_cmdline }}"
+      - "AppArmor: {{ 'disabled + masked' if selinux_disable_apparmor | bool else 'left alone (both LSMs configured — only one can win)' }}"
+      - "auditd: {{ 'enabled' if selinux_install_auditd | bool else 'NOT installed — audit=1 records will go nowhere' }}"
+      - >-
+        Relabel: {{ 'scheduled — the next boot relabels every filesystem and then REBOOTS ITSELF. That second reboot is expected.'
+        if selinux_needs_relabel | bool else 'not scheduled (target already labelled).' }}
+      - >-
+        {{ 'Mode is permissive: nothing is blocked, everything is logged.
+        Promotion path: SELINUX.md.' if selinux_mode == 'permissive'
+        else 'Mode is ENFORCING. If the desktop misbehaves, append enforcing=0
+        in GRUB — selinux=0 does NOT work on this kernel.' }}

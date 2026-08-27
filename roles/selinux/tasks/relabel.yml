@@ -1,0 +1,96 @@
+---
+# Nothing is relabelled here. A full relabel needs a kernel with the policy
+# loaded, which a live ISO running AppArmor does not have; the supported route
+# on Debian is /.autorelabel, which systemd's selinux-autorelabel-generator.sh
+# turns into a one-off boot that runs "fixfiles -F restore" and then reboots.
+# See SELINUX.md "The boot sequence after finalize".
+
+- name: Check whether the target filesystem already carries SELinux labels
+  # A fact about the filesystem rather than a stamp file this role wrote, so it
+  # stays honest across reinstalls, restores from backup and hand-editing.
+  # os.listxattr rather than getfattr(1) because the `attr` package is not
+  # guaranteed on the live ISO, while python3 is (ansible needs it).
+  ansible.builtin.command: >-
+    python3 -c "import os,sys; sys.exit(0 if 'security.selinux' in os.listxattr('{{ target_mount }}/etc/fstab') else 1)"
+  register: selinux_label_probe
+  changed_when: false
+  failed_when: false
+
+- name: Decide whether to schedule a relabel
+  ansible.builtin.set_fact:
+    selinux_unlabelled: "{{ selinux_label_probe.rc | default(1) != 0 }}"
+    selinux_needs_relabel: >-
+      {{ selinux_relabel_mode == 'always'
+         or (selinux_relabel_mode == 'auto' and selinux_label_probe.rc | default(1) != 0) }}
+
+- name: Refuse enforcing on an unlabelled system with no relabel scheduled
+  # Every file would carry the unlabeled_t default, so the first thing the
+  # policy denies is init reading its own filesystem. Recoverable only through
+  # the GRUB menu, which is not where anyone wants to spend the first boot.
+  ansible.builtin.assert:
+    that: not (selinux_mode == 'enforcing' and selinux_unlabelled and not selinux_needs_relabel)
+    fail_msg: >-
+      selinux_mode=enforcing but {{ target_mount }} carries no SELinux labels and
+      selinux_relabel_mode={{ selinux_relabel_mode }} schedules no relabel — that
+      boots into a policy where nothing on disk has a type. Set
+      selinux_relabel_mode=auto (or always), or start at
+      selinux_mode=permissive and follow the promotion path in SELINUX.md.
+    success_msg: "Relabel plan is consistent with selinux_mode={{ selinux_mode }}."
+
+- name: Schedule a full relabel at the next boot
+  # "-F" is read back by /usr/lib/systemd/selinux-autorelabel as
+  # "fixfiles $FORCE restore" — a from-scratch relabel that also resets
+  # customizable types, which is what a never-labelled install wants.
+  ansible.builtin.copy:
+    dest: "{{ target_mount }}/.autorelabel"
+    content: "-F\n"
+    owner: root
+    group: root
+    mode: "0644"
+  when: selinux_needs_relabel | bool
+
+- name: "Target is already labelled — no relabel scheduled"
+  ansible.builtin.debug:
+    msg: >-
+      {{ target_mount }} already carries SELinux labels, so no relabel was
+      scheduled. Force one with selinux_relabel_mode=always after changing
+      selinux_policy_type, adding semanage fcontext rules, or installing policy
+      modules — none of which the label probe can see.
+  when:
+    - not selinux_needs_relabel | bool
+    - not selinux_unlabelled | bool
+
+- name: "Warn that an unlabelled target was left unlabelled"
+  # never leaves any pending /.autorelabel alone rather than deleting it: the
+  # flag is also something an operator touches by hand, and this role is not the
+  # only writer. So this is a warning about intent, not a failure.
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: selinux_relabel_mode=never and {{ target_mount }} carries no
+      SELinux labels. The next boot will load the policy with every file still
+      at the unlabeled default — survivable only because selinux_mode is
+      permissive, and protecting nothing. Set selinux_relabel_mode=auto, or run
+      "fixfiles -F restore" on the booted system yourself.
+  when:
+    - not selinux_needs_relabel | bool
+    - selinux_unlabelled | bool
+
+- name: Warn that the AIDE baseline will predate the relabel
+  # Debian's AIDE links libselinux1 and its InodeData group includes X, the
+  # compound xattr group covering security.selinux. A baseline taken in the
+  # chroot therefore records pre-relabel labels for every file in /boot, and the
+  # boot check alarms on a change you made yourself. aide_init_mode=firstboot
+  # (the default) has no such problem: multi-user.target is never reached on the
+  # relabel boot, so the baseline is taken on the boot after it.
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: aide_init_mode=now takes the AIDE baseline during this run, but a
+      full SELinux relabel is scheduled for the next boot and will change the
+      security.selinux xattr on every file under /boot. fde-aide-boot-check will
+      alarm on the boot after the relabel. Once the machine has come back up,
+      run "sudo /usr/local/sbin/fde-aide-boot-accept" one time — or switch to
+      aide_init_mode=firstboot, which sequences itself correctly.
+  when:
+    - selinux_needs_relabel | bool
+    - aide_enabled | bool
+    - aide_init_mode == 'now'

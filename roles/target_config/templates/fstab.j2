@@ -1,0 +1,11 @@
+# /etc/fstab — managed by lmde7-fde finalize (installer original: /etc/fstab.pre-fde)
+# <file system>  <mount point>  <type>  <options>  <dump>  <pass>
+{% set root = lvs | selectattr('mount', 'equalto', '/') | first %}
+UUID={{ uuid_map['root'] }}  /  {{ root.fs }}  {{ root.mount_opts }}  0  {{ root.fs_pass }}
+UUID={{ uuid_map['boot'] }}  /boot  ext4  {{ boot_mount_opts }}  0  2
+UUID={{ uuid_map['esp'] }}  /boot/efi  vfat  {{ esp_mount_opts }}  0  1
+{% for lv in lvs if lv.mount not in ['/', 'none'] %}
+UUID={{ uuid_map[lv.name] }}  {{ lv.mount }}  {{ lv.fs }}  {{ lv.mount_opts }}  0  {{ lv.fs_pass }}
+{% endfor %}
+UUID={{ uuid_map['swap'] }}  none  swap  {{ (lvs | selectattr('name', 'equalto', 'swap') | first).mount_opts }}  0  0
+tmpfs  /dev/shm  tmpfs  {{ shm_mount_opts }}  0  0

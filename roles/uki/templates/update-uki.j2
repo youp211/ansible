@@ -1,0 +1,140 @@
+#!/bin/sh
+# managed by lmde7-fde — build one UKI per installed kernel into the ESP
+set -eu
+
+# FORCE_UKI=1 rebuilds every image even if it looks current.
+
+ESP="{{ uki_esp_mount }}"
+DIR="$ESP/{{ uki_dir }}"
+# A chainloaded UKI boots the cmdline compiled in here and nothing else —
+# /etc/default/grub and its grub.d drop-ins are not consulted. Anything that
+# must survive uki_enabled=true therefore has to appear on this line too.
+CMDLINE="root={{ root_mapper }} ro {{ kernel_cmdline_hardening }}{{ ' resume=' ~ swap_mapper if hibernate_enabled | bool else '' }}{% if selinux_enabled | bool %} {{ selinux_cmdline }}{% endif %}"
+
+UKIFY="$(command -v ukify || echo /usr/lib/systemd/ukify)"
+[ -x "$UKIFY" ] || { echo "ukify not found — install systemd-ukify" >&2; exit 1; }
+
+mountpoint -q "$ESP" || { echo "ESP not mounted at $ESP" >&2; exit 1; }
+mkdir -p "$DIR"
+
+built=""
+rebuilt=0
+
+# Retention is applied HERE, at the build stage, not as a prune afterwards.
+# Building every installed kernel and deleting the surplus later means the next
+# run rebuilds exactly what was just deleted — 160 MiB written and removed on
+# the ESP every single run. Ask me how I know.
+#
+# Why retain at all: every UKI on the ESP is signed by the db key, so every one
+# is selectable from the firmware boot menu. An old image with known CVEs is a
+# rollback target, and PCR 7 cannot tell them apart (identical signing cert).
+# The classic kernel fallback still lives in /boot, which is not bootable under
+# Secure Boot anyway.
+kernels="$(ls -1 /boot/vmlinuz-* 2>/dev/null | sort -V -r{% if uki_retain | int > 0 %} | head -n {{ uki_retain }}{% endif %})"
+
+for kernel in $kernels; do
+  [ -e "$kernel" ] || continue
+  kver="${kernel#/boot/vmlinuz-}"
+  initrd="/boot/initrd.img-$kver"
+  [ -e "$initrd" ] || continue
+  out="$DIR/lmde-$kver.efi"
+
+  # Skip when the image is already current. Rebuilding every run rewrites and
+  # re-signs ~160 MiB per kernel on the ESP for no change — needless flash wear
+  # and the only task keeping selinux.yml from being idempotent.
+  #
+  # "$0" is in the freshness test on purpose: the cmdline lives inside the UKI,
+  # so a cmdline change must force a rebuild even though the kernel and initrd
+  # are untouched. Ansible re-renders this script when any of those variables
+  # change (and only then), so the script being newer than the image is exactly
+  # the signal for "the embedded cmdline is stale".
+  if [ "${FORCE_UKI:-0}" != "1" ] && [ -f "$out" ] \
+     && [ "$out" -nt "$kernel" ] && [ "$out" -nt "$initrd" ] && [ "$out" -nt "$0" ]; then
+    echo "up to date: lmde-$kver.efi"
+    built="$built lmde-$kver.efi"
+    continue
+  fi
+
+  "$UKIFY" build \
+    --linux "$kernel" \
+    --initrd "$initrd" \
+    --cmdline "$CMDLINE" \
+    --os-release @/etc/os-release \
+    --uname "$kver" \
+{% if uki_pcr_sign | bool %}
+    --pcr-private-key "{{ uki_pcr_key }}" \
+    --pcr-public-key "{{ uki_pcr_pub }}" \
+    --pcrpkey "{{ uki_pcr_pub }}" \
+{% if uki_pcr_phases | length > 0 %}
+    --phases "{{ uki_pcr_phases }}" \
+{% endif %}
+{% endif %}
+    --output "$out"
+{% if uki_sign | bool %}
+  sbsign --key "{{ uki_sign_key }}" --cert "{{ uki_sign_cert }}" \
+    --output "$out" "$out"
+{% endif %}
+  built="$built lmde-$kver.efi"
+  rebuilt=$((rebuilt + 1))
+done
+
+# Machine-readable, so the ansible task can set changed_when honestly instead of
+# claiming a change on every run.
+echo "rebuilt $rebuilt image(s)"
+
+# prune UKIs whose kernel no longer exists
+for uki in "$DIR"/lmde-*.efi; do
+  [ -e "$uki" ] || continue
+  case " $built " in
+    *" $(basename "$uki") "*) ;;
+    *) rm -f "$uki" ;;
+  esac
+done
+
+echo "UKIs present in $DIR:"
+ls -1 "$DIR" 2>/dev/null || true
+
+{% if uki_efi_entry | bool %}
+# ---- firmware boot entry for the NEWEST UKI ------------------------------
+#
+# Booting the UKI straight from firmware is the point of the whole exercise: it
+# removes shim and GRUB from the chain, so firmware verifies a binary signed by
+# YOUR key rather than one signed by the Microsoft 3rd-party UEFI CA. That CA is
+# what a hardened setup removes from db, and once it is gone shim cannot load at
+# all.
+#
+# The entry has to be re-pointed on every kernel install, because the UKI
+# filename carries the version. -V is version sort; plain sort would call
+# lmde-6.12.101 newer than lmde-7.2.0.
+newest="$(ls -1 "$DIR"/*.efi 2>/dev/null | sort -V -r | head -n1 || true)"
+if [ -n "$newest" ] && command -v efibootmgr >/dev/null 2>&1; then
+    loader="\\{{ uki_dir | replace('/', '\\') }}\\$(basename "$newest")"
+    espdev="$(findmnt -no SOURCE "$ESP")"
+    espnode="$(basename "$espdev")"
+    partnum="$(cat "/sys/class/block/$espnode/partition")"
+    diskdev="/dev/$(basename "$(readlink -f "/sys/class/block/$espnode/..")")"
+
+    # Only touch NVRAM when the target actually changed — these writes are not
+    # free and firmware NVRAM is not infinitely rewritable.
+    current="$(efibootmgr -v | sed -n "s/^Boot\([0-9A-F]\{4\}\)\*\? {{ uki_efi_label }}\t.*/\1/p" | head -n1)"
+    want_re="$(printf '%s' "$loader" | sed 's/\\/\\\\/g')"
+    if [ -n "$current" ] && efibootmgr -v | grep -q "^Boot$current\*\?.*$want_re"; then
+        echo "firmware entry Boot$current already points at $(basename "$newest")"
+    else
+        [ -n "$current" ] && efibootmgr -q -B -b "$current"
+        efibootmgr -q -c -d "$diskdev" -p "$partnum" -L "{{ uki_efi_label }}" -l "$loader"
+        echo "firmware entry re-pointed at $(basename "$newest")"
+    fi
+{% if uki_efi_default | bool %}
+    # Put it first so the machine boots the UKI directly. UEFI falls through to
+    # the next BootOrder entry if this one fails to load, so shim/GRUB remains
+    # the automatic fallback.
+    ent="$(efibootmgr | sed -n "s/^Boot\([0-9A-F]\{4\}\)\*\? {{ uki_efi_label }}$/\1/p" | head -n1)"
+    if [ -n "$ent" ]; then
+        rest="$(efibootmgr | sed -n 's/^BootOrder: //p' | tr ',' '\n' | grep -v "^$ent$" | paste -sd, -)"
+        efibootmgr -q -o "$ent${rest:+,$rest}"
+        echo "BootOrder now: $(efibootmgr | sed -n 's/^BootOrder: //p')"
+    fi
+{% endif %}
+fi
+{% endif %}

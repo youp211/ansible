@@ -1,0 +1,61 @@
+---
+# SERVER MODE — push the signed packages into a hosted apt repo so other
+# machines can install them. See the worked example in group_vars/all.yml.
+#
+# This deliberately carries NO GPG secret key. reprepro on the repo host signs
+# the Release file with whatever its conf/distributions names in SignWith:, and
+# that key stays on the host.
+
+- name: Config contract — server mode needs its connection details
+  ansible.builtin.assert:
+    that:
+      - kernel_repo_host | length > 0
+      - kernel_repo_user | length > 0
+      - kernel_repo_incoming | length > 0
+      - kernel_repo_basedir | length > 0
+      - kernel_repo_suite | length > 0
+    fail_msg: >-
+      kernel_repo_publish=true but the repo connection details are empty. Fill
+      in kernel_repo_host/user/incoming/basedir/suite in group_vars/all.yml —
+      there is a worked example in the same block — or set
+      kernel_repo_publish=false.
+    success_msg: "Publisher targets {{ kernel_repo_user }}@{{ kernel_repo_host }}:{{ kernel_repo_basedir }}."
+
+- name: Collect the packages to publish
+  ansible.builtin.find:
+    paths: "{{ target_mount }}{{ kernel_build_dir }}/out"
+    patterns: "*.deb"
+  register: kernel_publish_debs
+
+- name: Ship the packages to the repo host
+  # --chmod=F644 because the repo host serves these over HTTP; a 0600 deb in the
+  # pool is a 403 for every client.
+  ansible.builtin.command:
+    argv: >-
+      {{ ['rsync', '-av', '--chmod=F644', '-e',
+          'ssh -o BatchMode=yes' ~ (' -i ' ~ kernel_repo_ssh_key if kernel_repo_ssh_key | length > 0 else '')]
+         + (kernel_publish_debs.files | map(attribute='path') | list)
+         + [kernel_repo_user ~ '@' ~ kernel_repo_host ~ ':' ~ kernel_repo_incoming ~ '/'] }}
+  register: kernel_rsync
+  changed_when: true
+
+- name: Fold the packages into the repo with reprepro
+  # includedeb is idempotent per version: re-running with the same .deb is a
+  # no-op ("already registered"), a newer version supersedes. reprepro
+  # regenerates and re-signs Release itself.
+  ansible.builtin.command:
+    argv: >-
+      {{ ['ssh', '-o', 'BatchMode=yes']
+         + (['-i', kernel_repo_ssh_key] if kernel_repo_ssh_key | length > 0 else [])
+         + [kernel_repo_user ~ '@' ~ kernel_repo_host,
+            'reprepro -b ' ~ kernel_repo_basedir ~ ' includedeb ' ~ kernel_repo_suite ~ ' '
+            ~ (kernel_publish_debs.files | map(attribute='path') | map('basename')
+               | map('regex_replace', '^', kernel_repo_incoming ~ '/') | join(' '))] }}
+  register: kernel_reprepro
+  changed_when: "'Exporting indices' in (kernel_reprepro.stdout + kernel_reprepro.stderr)"
+
+- name: Publish result
+  ansible.builtin.debug:
+    msg:
+      - "Published {{ kernel_publish_debs.matched }} package(s) to {{ kernel_repo_host }}:{{ kernel_repo_basedir }} ({{ kernel_repo_suite }})."
+      - "{{ (kernel_reprepro.stdout_lines + kernel_reprepro.stderr_lines) | reject('equalto', '') | list }}"

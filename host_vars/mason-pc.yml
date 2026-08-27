@@ -1,0 +1,35 @@
+---
+# Machine-specific overrides for 192.168.0.97 (mason-pc).
+# group_vars/all.yml holds this workstation's values; anything that differs
+# per machine belongs here.
+
+# 1.8 TiB disk, not the 953 GiB of the box group_vars was written for. Only
+# prep.yml checks this, and prep.yml must NEVER run here — but a wrong value
+# sitting in the tree is a trap for whoever does run it.
+expected_disk_size_gib: 1863
+
+# This machine dual-boots Windows from a second NVMe with its own ESP, and its
+# db carries the ASUS vendor keys plus Microsoft's 2011 AND 2023 CAs. Replacing
+# the platform keys the way the HP box did would stop Windows booting, so
+# secure boot key ownership is OFF here and must stay a deliberate decision.
+secureboot_enabled: false
+secureboot_enroll: false
+
+# No firmware enrolment during this prep pass.
+mok_enroll: false
+
+# SELinux IS wanted here — selinux.yml installs it, and only then does the
+# security=selinux that update-uki compiles into every image mean anything.
+# Order matters: install the policy BEFORE building a UKI that asks for it, or
+# the machine boots with the LSM slot given to SELinux, no policy to load, and
+# AppArmor excluded — i.e. no MAC at all. selinux.yml does both in that order.
+
+# DUAL BOOT: Windows lives on a second NVMe with its own ESP (nvme1n1p1), and
+# os-prober currently puts "Windows Boot Manager (on /dev/nvme1n1p1)" in the
+# GRUB menu. group_vars sets grub_disable_os_prober: true for the single-boot
+# workstation, and target_config renders that into 90-fde-hardening.cfg — which
+# sorts AFTER LMDE's own 50_lmde.cfg and would therefore win, removing the
+# Windows entry the next time finalize.yml runs here. Pin it off.
+# (Windows stays reachable from the firmware boot menu either way: it is
+# Boot0000, on its own ESP, signed by a Microsoft CA that is still in db.)
+grub_disable_os_prober: false

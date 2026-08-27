@@ -1,0 +1,205 @@
+---
+# PHASE 2 — run AFTER the Mint installer reports success, BEFORE rebooting.
+# Mounts the installed system at {{ target_mount }}, then: crypttab, CIS fstab,
+# LV data migration, fscrypt config, TPM2+PIN enrollment, resume=, hardened
+# GRUB cmdline, initramfs rebuild. The MOK (signing key) is generated before the
+# UKI role runs (default: disabled), then SELinux replaces AppArmor (default:
+# on, permissive), then AIDE is configured against the finished boot chain.
+# Building a kernel is NOT part of finalize: that is kernel.yml.
+
+- name: "Phase 2: finalize installed system"
+  hosts: live
+  become: true
+  vars_prompt:
+    - name: luks_passphrase
+      prompt: "LUKS recovery passphrase (unlocks container if closed; authorizes TPM2 enrollment)"
+      private: true
+    - name: tpm2_pin
+      prompt: "New TPM2 PIN to require at every boot"
+      private: true
+      confirm: true
+
+  roles:
+    - config_contract
+    - target_mount
+    - migrate_mounts
+    - target_config
+    # Before uki: uki_sign needs the key to already exist. Generating it is
+    # local openssl with no network, so it cannot strand a run the way an apt
+    # step could. roles/kernel is deliberately NOT here — see KERNEL.md.
+    - mok
+    - tpm2_enroll
+    - uki
+    # After target_config, so a failure here can never cost you crypttab/fstab;
+    # before the post_tasks, so 91-fde-selinux.cfg is on disk when update-grub
+    # runs and update-uki is re-rendered before the UKIs are rebuilt.
+    - selinux
+
+  post_tasks:
+    - name: Rebuild the target initramfs (picks up crypttab, resume, tpm hook)
+      ansible.builtin.command: chroot {{ target_mount }} update-initramfs -u -k all
+      changed_when: true
+
+    - name: Inspect the initramfs for the TPM2 token plugin + TCTI
+      ansible.builtin.shell: |
+        set -o pipefail
+        for img in {{ target_mount }}/boot/initrd.img-*; do
+          echo "== $img"
+          lsinitramfs "$img" | grep -E 'libcryptsetup-token-systemd-tpm2|libtss2-(esys|rc|mu|tctildr|tcti-device)' || true
+        done
+      args:
+        executable: /bin/bash
+      register: initrd_scan
+      changed_when: false
+      when: tpm2_enroll | bool
+
+    - name: Show initramfs scan
+      ansible.builtin.debug:
+        msg: "{{ initrd_scan.stdout_lines }}"
+      when: tpm2_enroll | bool
+
+    - name: Verify the TPM2 unlock script is ordered BEFORE cryptroot in the initramfs
+      ansible.builtin.shell: |
+        set -o pipefail
+        rc=0
+        for img in {{ target_mount }}/boot/initrd.img-*; do
+          tmp="$(mktemp -d -p {{ target_mount }}/tmp)"
+          if ! unmkinitramfs "$img" "$tmp" >/dev/null 2>&1; then
+            echo "== $img: could not unpack for ORDER inspection"
+            rm -rf "$tmp"; rc=1; continue
+          fi
+          f="$(find "$tmp" -path '*/scripts/local-top/ORDER' | head -1)"
+          if [ -z "$f" ]; then
+            echo "== $img: no local-top/ORDER found"
+            rm -rf "$tmp"; rc=1; continue
+          fi
+          t=$(grep -n '00_fde_tpm2_unlock' "$f" | head -1 | cut -d: -f1)
+          c=$(grep -n 'local-top/cryptroot' "$f" | head -1 | cut -d: -f1)
+          echo "== $(basename "$img"): tpm2-unlock=line ${t:-MISSING} cryptroot=line ${c:-MISSING}"
+          if [ -z "$t" ] || [ -z "$c" ] || [ "$t" -ge "$c" ]; then rc=1; fi
+          rm -rf "$tmp"
+        done
+        exit $rc
+      args:
+        executable: /bin/bash
+      register: order_scan
+      changed_when: false
+      failed_when: false
+      when: tpm2_enroll | bool
+
+    - name: Show initramfs run order
+      ansible.builtin.debug:
+        msg: "{{ order_scan.stdout_lines }}"
+      when: tpm2_enroll | bool
+
+    - name: Assert the unlock script wins the ordering (else the PIN is never asked for)
+      ansible.builtin.assert:
+        that: order_scan.rc == 0
+        fail_msg: >-
+          00_fde_tpm2_unlock does not run before cryptroot in the initramfs, so
+          the PIN-protected LUKS2 token would never be tried and boot would go
+          straight to the passphrase prompt. See VERIFY.md section 5.
+      when:
+        - tpm2_enroll | bool
+        - tpm2_require_initramfs_token | bool
+
+    - name: Assert the token plugin made it into every initramfs
+      ansible.builtin.assert:
+        that:
+          - "'libcryptsetup-token-systemd-tpm2' in initrd_scan.stdout"
+          - "'libtss2-tcti-device' in initrd_scan.stdout"
+          # systemd dlopen()s these three; a missing one yields -ENOTSUP at
+          # boot: "Could not find TPM2 device: Operation not supported".
+          - "'libtss2-esys' in initrd_scan.stdout"
+          - "'libtss2-rc' in initrd_scan.stdout"
+        fail_msg: >-
+          The rebuilt initramfs lacks the systemd-tpm2 token plugin — TPM2 PIN
+          unlock would silently fall back to the passphrase prompt. See
+          VERIFY.md section 5. Set tpm2_require_initramfs_token=false to
+          proceed anyway (passphrase boot still works).
+      when:
+        - tpm2_enroll | bool
+        - tpm2_require_initramfs_token | bool
+
+    - name: Rebuild UKIs against the freshly built initramfs
+      ansible.builtin.command: chroot {{ target_mount }} /usr/local/sbin/update-uki
+      when: uki_enabled | bool
+      changed_when: true
+
+    - name: Ensure GRUB EFI + shim are present in the target (expert-mode installs may skip the bootloader)
+      ansible.builtin.command: >-
+        chroot {{ target_mount }} env DEBIAN_FRONTEND=noninteractive
+        apt-get install -y grub-efi-amd64 grub-efi-amd64-signed shim-signed
+      register: grub_pkgs
+      changed_when: "'0 newly installed' not in grub_pkgs.stdout"
+
+    - name: Install GRUB to the ESP (idempotent; no-op if the installer already did)
+      ansible.builtin.command: chroot {{ target_mount }} grub-install
+      changed_when: true
+
+    - name: Regenerate grub.cfg with the hardened cmdline
+      ansible.builtin.command: chroot {{ target_mount }} update-grub
+      changed_when: true
+
+    - name: Assert resume= reached the generated grub.cfg
+      ansible.builtin.shell: |
+        set -o pipefail
+        grep -q 'resume={{ swap_mapper }}' {{ target_mount }}/boot/grub/grub.cfg
+      args:
+        executable: /bin/bash
+      changed_when: false
+      when: hibernate_enabled | bool
+
+    - name: Configure AIDE file integrity monitoring
+      # Last, and deliberately so: the baseline has to be taken against the boot
+      # chain this run just finished building (initramfs, grub.cfg, UKIs). Being
+      # a post_task also means a failure here cannot strand the boot chain.
+      ansible.builtin.include_role:
+        name: aide
+
+    - name: Teardown — unmount target and close the stack
+      when:
+        - finalize_teardown | bool
+        - target_mount != '/'   # never recursively unmount a running root
+      block:
+        - name: Detach API/bind mounts (lazy — session dirs under /run can be busy)
+          ansible.builtin.shell: |
+            for m in run dev proc sys; do
+              mountpoint -q {{ target_mount }}/$m && umount -R -l {{ target_mount }}/$m
+            done
+            exit 0
+          changed_when: true
+
+        - name: Deactivate swap on the target's swap LV
+          ansible.builtin.command: swapoff /dev/{{ vg_name }}/swap
+          failed_when: false
+          changed_when: true
+
+        - name: Recursively unmount the target tree
+          ansible.builtin.command: umount -R {{ target_mount }}
+          register: umount_r
+          retries: 3
+          delay: 2
+          until: umount_r.rc == 0
+          changed_when: true
+
+        - name: Deactivate volume group
+          ansible.builtin.command: vgchange -an {{ vg_name }}
+          changed_when: true
+
+        - name: Close LUKS container
+          community.crypto.luks_device:
+            name: "{{ luks_name }}"
+            state: closed
+
+    - name: Done
+      ansible.builtin.debug:
+        msg:
+          - "Finalize complete. Work through VERIFY.md, then reboot."
+          - "First boot: GRUB -> initramfs asks for the TPM2 PIN"
+          - "(recovery passphrase always works as fallback)."
+          - >-
+            {{ 'Then SELinux relabels every filesystem and REBOOTS ITSELF once. That
+            second reboot is expected — see SELINUX.md.'
+            if selinux_enabled | bool and selinux_needs_relabel | default(false) | bool
+            else 'SELinux: no relabel pending.' }}

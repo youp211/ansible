@@ -1,0 +1,14 @@
+---
+- name: Refresh the apt index inside the target
+  ansible.builtin.command: chroot {{ target_mount }} apt-get update
+  changed_when: false
+
+- name: Install the kernel build toolchain into the target
+  # Fatal on purpose: unlike the aide/selinux roles this only ever runs from
+  # kernel.yml, where there is no boot chain to strand, and a missing compiler
+  # is not something to discover halfway through a build.
+  ansible.builtin.command: >-
+    chroot {{ target_mount }} env DEBIAN_FRONTEND=noninteractive
+    apt-get install -y {{ kernel_build_packages | join(' ') }}
+  register: kernel_apt
+  changed_when: "'0 newly installed' not in kernel_apt.stdout"

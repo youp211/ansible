@@ -1,0 +1,137 @@
+---
+# The committing step. Everything here writes firmware policy.
+#
+# ORDER IS db -> KEK -> PK, and that is not arbitrary: while PK is empty the
+# firmware is in setup mode and accepts any write. Writing PK is what CLOSES
+# setup mode, so it has to be last. Enrol it first and the later writes need a
+# signature chain that is not yet in place.
+
+- name: Read the current firmware state
+  # Globs rather than "ls | grep", and no "| head" anywhere: under pipefail a
+  # head that exits early hands the producer a SIGPIPE and the pipeline reports
+  # 141 even on success. od | awk is safe because awk drains its input.
+  ansible.builtin.shell: |
+    set -o pipefail
+    sm=0
+    for f in /sys/firmware/efi/efivars/SetupMode-*; do
+      [ -e "$f" ] || continue
+      sm=$(od -An -tu1 "$f" | awk '{print $5}')
+      break
+    done
+    echo "$sm"
+  args:
+    executable: /bin/bash
+  register: sb_setupmode
+  changed_when: false
+
+- name: Check whether this hierarchy is already ours
+  # Rule 4: reruns are a feature. Once PK is installed the firmware leaves setup
+  # mode, so a naive "assert SetupMode==1" would turn every later run into a
+  # failure. Distinguish "already done" from "cannot be done".
+  ansible.builtin.shell: |
+    set -o pipefail
+    out="$(mokutil --pk 2>/dev/null || true)"
+    printf '%s' "$out" | grep -c '{{ secureboot_cn_prefix }} Platform Key' || true
+  args:
+    executable: /bin/bash
+  register: sb_owned
+  changed_when: false
+
+- name: Platform already owned — nothing to enrol
+  ansible.builtin.debug:
+    msg: >-
+      PK already holds "{{ secureboot_cn_prefix }} Platform Key", so this
+      machine is already running your hierarchy. To re-key: clear the Secure
+      Boot keys in firmware (which reopens setup mode), delete
+      {{ secureboot_dir }}, and re-run.
+  when: sb_owned.stdout | trim | int > 0
+
+- name: Enrol the hierarchy
+  # ONE guard on the block, not one per task. Per-task guards were a bug: a
+  # `when:` list short-circuits in order, so a condition referencing a register
+  # from an earlier SKIPPED task (sb_uki.stdout) is evaluated before the guard
+  # that would have prevented it, and raises "object of type 'dict' has no
+  # attribute 'stdout'". A block guard cannot get that ordering wrong.
+  when: sb_owned.stdout | trim | int == 0
+  block:
+    - name: Refuse to enrol outside setup mode
+      # Not a limitation to work around: if software could clear PK, Secure Boot
+      # would be worthless. Clearing keys is a firmware action, by design.
+      ansible.builtin.assert:
+        that: sb_setupmode.stdout | trim == '1'
+        fail_msg: >-
+          SetupMode is {{ sb_setupmode.stdout | trim }}, so the firmware still
+          holds a platform key that is not ours and will reject unsigned
+          variable writes. Enter firmware setup and CLEAR the Secure Boot keys
+          (HP: set a BIOS Administrator Password first, then Security -> Secure
+          Boot Key Management -> clear), which empties PK and opens setup mode.
+          Then re-run. SECUREBOOT.md has the full sequence.
+        success_msg: "Firmware is in setup mode — the hierarchy can be written."
+
+    - name: Find the UKI this machine actually boots
+      # sort drains its input so pipefail is safe here; taking the first line
+      # with parameter expansion instead of "| head" keeps it that way.
+      ansible.builtin.shell: |
+        set -o pipefail
+        shopt -s nullglob
+        all="$(printf '%s\n' {{ uki_esp_mount }}/{{ uki_dir }}/*.efi | sort -V -r)"
+        printf '%s' "${all%%$'\n'*}"
+      args:
+        executable: /bin/bash
+        chdir: "{{ target_mount }}"
+      register: sb_uki
+      changed_when: false
+
+    - name: Prove the db certificate can verify that UKI
+      # The one mistake here that costs a firmware trip. Enrolling a db that
+      # cannot load your own boot image leaves nothing bootable under Secure Boot.
+      ansible.builtin.command: >-
+        chroot {{ target_mount }} sbverify --cert {{ secureboot_db_cert }} {{ sb_uki.stdout | trim }}
+      register: sb_verify
+      changed_when: false
+      failed_when: false
+      when: sb_uki.stdout | trim | length > 0
+
+    - name: Assert the enrolled db will boot this machine
+      ansible.builtin.assert:
+        that:
+          - sb_uki.stdout | trim | length > 0
+          - sb_verify.rc | default(1) == 0
+        fail_msg: >-
+          {{ secureboot_db_cert }} does not verify the newest UKI on the ESP, so
+          a db containing only that certificate would leave this machine with
+          nothing bootable under Secure Boot. Build and sign the UKIs first
+          (uki_enabled + uki_sign, see KERNEL.md). Override with
+          secureboot_require_bootable=false only if you know why.
+        success_msg: "db certificate verifies the newest UKI — safe to enrol."
+      when: secureboot_require_bootable | bool
+
+    - name: Note that no vendor db certificates survive a key clear
+      # Some dGPU/Thunderbolt/NIC option ROMs are vendor-signed and may not
+      # initialise under Secure Boot without the vendor cert present.
+      ansible.builtin.debug:
+        msg: >-
+          secureboot_keep_vendor_db=true, but the firmware keys are already
+          cleared so there are no vendor certificates left to preserve. If
+          option ROMs misbehave under Secure Boot, restore factory keys in
+          firmware, note the vendor certificate, and re-run with it added to db
+          by hand.
+      when: secureboot_keep_vendor_db | bool
+
+    - name: Enrol db (what firmware will load)
+      ansible.builtin.command: >-
+        chroot {{ target_mount }} efi-updatevar -f {{ secureboot_dir }}/db.auth db
+      register: sb_db
+      changed_when: sb_db.rc == 0
+
+    - name: Enrol KEK (may update db later)
+      ansible.builtin.command: >-
+        chroot {{ target_mount }} efi-updatevar -f {{ secureboot_dir }}/KEK.auth KEK
+      register: sb_kek
+      changed_when: sb_kek.rc == 0
+
+    - name: Enrol PK last — this closes setup mode and hands you the platform
+      ansible.builtin.command: >-
+        chroot {{ target_mount }} efi-updatevar -f {{ secureboot_dir }}/PK.auth PK
+      register: sb_pk
+      changed_when: sb_pk.rc == 0

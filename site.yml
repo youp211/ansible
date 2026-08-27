@@ -1,0 +1,53 @@
+---
+# Run the phases separately (recommended — the Mint installer runs in between):
+#   ansible-playbook prep.yml        # BEFORE the installer
+#   ansible-playbook finalize.yml    # AFTER the installer, BEFORE reboot
+#
+# Or via site.yml with tags:
+#   ansible-playbook site.yml --tags prep
+#   ansible-playbook site.yml --tags finalize
+#   ansible-playbook site.yml --tags aide -e target_mount=/     # AIDE on its own
+#   ansible-playbook site.yml --tags selinux -e target_mount=/  # SELinux on its own
+#   ansible-playbook site.yml --tags kernel -e target_mount=/       # MOK + repo
+#   ansible-playbook site.yml --tags kernel-build -e target_mount=/ # compile a kernel
+#   ansible-playbook site.yml --tags secureboot -e target_mount=/   # own the platform keys
+
+- name: Phase 1 — prep the disk (destructive)
+  import_playbook: prep.yml
+  tags: [prep, never]
+
+- name: Phase 1.5 — assemble the layout for the installer
+  import_playbook: mount-for-installer.yml
+  tags: [mount, never]
+
+- name: Phase 2 — finalize the installed system
+  import_playbook: finalize.yml
+  tags: [finalize, never]
+
+- name: SELinux only
+  import_playbook: selinux.yml
+  tags: [selinux, never]
+
+- name: MOK and signed kernel only
+  import_playbook: kernel.yml
+  tags: [kernel, never]
+
+- name: Kernel compile only
+  import_playbook: kernel-build.yml
+  tags: [kernel-build, never]
+
+- name: UKI build and signing only
+  import_playbook: uki.yml
+  tags: [uki, never]
+
+- name: Secure Boot key ownership only
+  import_playbook: secureboot.yml
+  tags: [secureboot, never]
+
+- name: TPM2 re-enrolment only
+  import_playbook: tpm2.yml
+  tags: [tpm2, never]
+
+- name: AIDE only
+  import_playbook: aide.yml
+  tags: [aide, never]

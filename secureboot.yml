@@ -1,0 +1,40 @@
+---
+# SECURE BOOT — replace the factory PK/KEK/db with a hierarchy you own.
+#
+#   sudo ansible-playbook secureboot.yml -e target_mount=/                          # generate + stage
+#   sudo ansible-playbook secureboot.yml -e target_mount=/ -e secureboot_enroll=true # commit
+#
+# Generating keys changes no firmware state and is safe any time. Enrolment
+# writes platform policy and needs the firmware in SETUP MODE, which only you
+# can arrange: firmware setup -> clear the Secure Boot keys. That is by design —
+# if software could clear PK, Secure Boot would be worthless.
+#
+# Read SECUREBOOT.md first. In particular: with a db holding only your key,
+# shim and GRUB stop loading under Secure Boot, so the only thing that boots is
+# a UKI you signed, and recovery is turning Secure Boot off in firmware.
+
+- name: "Secure Boot: own the platform keys"
+  hosts: live
+  become: true
+
+  pre_tasks:
+    - name: Look for an installed system at the target mount
+      ansible.builtin.stat:
+        path: "{{ target_mount }}/etc/os-release"
+      register: sb_target_os
+
+    - name: Assert the target holds an installed system
+      ansible.builtin.assert:
+        that: sb_target_os.stat.exists
+        fail_msg: >-
+          No {{ target_mount }}/etc/os-release — nothing is installed there.
+          On the booted system run this with -e target_mount=/ .
+        success_msg: "Installed system found at {{ target_mount }}."
+
+  roles:
+    # roles/mok first: db is the MOK, so it has to exist before the signature
+    # lists are built. Generation only — enrolling a MOK is irrelevant here,
+    # since a custom db removes shim (and therefore MokList) from the chain.
+    - config_contract
+    - mok
+    - secureboot

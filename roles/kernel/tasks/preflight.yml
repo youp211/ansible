@@ -1,0 +1,82 @@
+---
+# Everything here is checked BEFORE the build starts. A forty-minute build that
+# dies on "Permission denied" or "No space left on device" is the single most
+# expensive failure this role can have.
+
+- name: Refuse to build without a MOK to sign with
+  ansible.builtin.assert:
+    that: not ((kernel_sign_image | bool or kernel_sign_modules | bool) and not mok_enabled | bool)
+    fail_msg: >-
+      kernel_sign_image/kernel_sign_modules are on but mok_enabled=false, so
+      there is no key to sign with. Set mok_enabled=true (roles/mok generates
+      one), or turn the signing flags off and accept an unsigned kernel that
+      Secure Boot will refuse.
+    success_msg: "Signing prerequisites are consistent."
+
+- name: Warn that the -dbg package will be built and then thrown away
+  # Measured on the 7.2.0 build: dpkg-deb spent ~20 minutes at 740% CPU
+  # compressing linux-image-7.2.0-dbg, which this role then deleted. The two
+  # settings interact badly and neither one says so on its own:
+  # kernel_build_dbg_package only controls whether the .deb is KEPT, while
+  # bindeb-pkg decides whether to BUILD it purely from CONFIG_DEBUG_INFO.
+  # The only way to actually skip the work is kernel_debug_info=false — which
+  # also drops CONFIG_DEBUG_INFO_BTF and takes bpftrace/bcc with it, so it is
+  # a real trade rather than free savings.
+  ansible.builtin.debug:
+    msg: >-
+      NOTE: kernel_debug_info=true with kernel_build_dbg_package=false means the
+      ~1 GiB -dbg package is built and compressed in full (about twenty minutes
+      of this run) and then deleted. To actually skip that work set
+      kernel_debug_info=false, at the cost of CONFIG_DEBUG_INFO_BTF — which
+      bpftrace, bcc and other eBPF tooling need. To keep the package instead,
+      set kernel_build_dbg_package=true.
+  when:
+    - kernel_debug_info | bool
+    - not kernel_build_dbg_package | bool
+
+- name: Ensure the build directory exists
+  ansible.builtin.file:
+    path: "{{ target_mount }}{{ kernel_build_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Inspect the filesystem behind the build directory
+  ansible.builtin.command: >-
+    findmnt -no TARGET,OPTIONS,AVAIL -b --target {{ target_mount }}{{ kernel_build_dir }}
+  register: kernel_build_fs
+  changed_when: false
+
+- name: Record what that filesystem allows
+  ansible.builtin.set_fact:
+    kernel_build_noexec: "{{ 'noexec' in (kernel_build_fs.stdout.split()[1] | default('')) }}"
+    kernel_build_avail_gib: "{{ ((kernel_build_fs.stdout.split()[2] | default('0') | int) / 1073741824) | round(1) }}"
+
+- name: Refuse to build on a noexec filesystem
+  # Not a permissions nicety: the kernel build compiles its own tools
+  # (scripts/basic/fixdep, objtool, scripts/sorttable) and then executes them
+  # out of the source tree thousands of times. noexec turns that into
+  # "Permission denied" about ninety seconds in.
+  ansible.builtin.assert:
+    that: not kernel_build_noexec | bool
+    fail_msg: >-
+      kernel_build_dir ({{ kernel_build_dir }}) is on a filesystem mounted
+      noexec ({{ kernel_build_fs.stdout.split()[0] | default('?') }}), and a
+      kernel build executes the tools it compiles out of its own source tree.
+      This project's CIS fstab mounts /tmp and /var/tmp noexec, so neither can
+      be used. Point kernel_build_dir at the home LV (the default,
+      /home/kernel-build) or another filesystem without noexec.
+    success_msg: "Build directory is on an exec-capable filesystem."
+
+- name: Refuse to build without room for the object tree
+  ansible.builtin.assert:
+    that: kernel_build_avail_gib | float >= kernel_build_min_free_gib | float
+    fail_msg: >-
+      kernel_build_dir ({{ kernel_build_dir }}) has
+      {{ kernel_build_avail_gib }} GiB free but
+      {{ kernel_build_min_free_gib }} GiB is required. A CONFIG_DEBUG_INFO tree
+      runs 30-50 GiB. Either point kernel_build_dir at the home LV, or set
+      kernel_debug_info=false to shrink the tree about fivefold — at the cost of
+      CONFIG_DEBUG_INFO_BTF, which takes bpftrace and bcc with it (KERNEL.md).
+    success_msg: "{{ kernel_build_avail_gib }} GiB free in {{ kernel_build_dir }}."

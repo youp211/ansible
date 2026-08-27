@@ -1,0 +1,57 @@
+---
+- name: Start the device list for UUID collection (raw partitions)
+  ansible.builtin.set_fact:
+    uuid_targets:
+      - { key: "luks", dev: "{{ part_prefix }}3" }
+      - { key: "esp",  dev: "{{ part_prefix }}1" }
+      - { key: "boot", dev: "{{ part_prefix }}2" }
+
+- name: Append one entry per logical volume
+  ansible.builtin.set_fact:
+    uuid_targets: "{{ uuid_targets + [{'key': item.name, 'dev': '/dev/' ~ vg_name ~ '/' ~ item.name}] }}"
+  loop: "{{ lvs }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Collect filesystem UUIDs
+  ansible.builtin.command: blkid -s UUID -o value {{ item.dev }}
+  loop: "{{ uuid_targets }}"
+  loop_control:
+    label: "{{ item.key }}"
+  register: blkid_multi
+  changed_when: false
+
+- name: Assemble UUID map
+  ansible.builtin.set_fact:
+    uuid_map: >-
+      {{ dict(blkid_multi.results | map(attribute='item.key')
+              | zip(blkid_multi.results | map(attribute='stdout') | map('trim'))) }}
+
+- name: Sanity — every device produced a UUID
+  ansible.builtin.assert:
+    that:
+      - uuid_map | length == uuid_targets | length
+      - uuid_map.values() | select('eq', '') | list | length == 0
+    fail_msg: "blkid returned an empty UUID for at least one device: {{ uuid_map }}"
+
+- name: Preserve the installer's fstab (once)
+  ansible.builtin.command: >-
+    cp -a {{ target_mount }}/etc/fstab {{ target_mount }}/etc/fstab.pre-fde
+  args:
+    creates: "{{ target_mount }}/etc/fstab.pre-fde"
+
+- name: Write /etc/crypttab (the installer does not — without this the system cannot boot)
+  ansible.builtin.template:
+    src: crypttab.j2
+    dest: "{{ target_mount }}/etc/crypttab"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Write the CIS-hardened /etc/fstab
+  ansible.builtin.template:
+    src: fstab.j2
+    dest: "{{ target_mount }}/etc/fstab"
+    owner: root
+    group: root
+    mode: "0644"

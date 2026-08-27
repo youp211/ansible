@@ -1,0 +1,73 @@
+---
+# SELINUX ONLY — mandatory access control on an already-installed system.
+#
+#   sudo ansible-playbook selinux.yml -e target_mount=/     # on the booted system
+#   sudo ansible-playbook selinux.yml                       # live ISO, /target mounted
+#
+# finalize.yml runs this role itself. This playbook is the way back in
+# afterwards — promote permissive to enforcing, set a boolean, force a relabel,
+# or turn the whole thing off again — without going near crypttab, fstab, the
+# GRUB password or the TPM2 enrollment.
+#
+# It regenerates grub.cfg itself, and rebuilds the UKIs when uki_enabled,
+# because both of those carry the kernel command line.
+
+- name: "SELinux: mandatory access control"
+  hosts: live
+  become: true
+
+  pre_tasks:
+    - name: Look for an installed system at the target mount
+      ansible.builtin.stat:
+        path: "{{ target_mount }}/etc/os-release"
+      register: selinux_target_os
+
+    - name: Assert the target holds an installed system
+      ansible.builtin.assert:
+        that: selinux_target_os.stat.exists
+        fail_msg: >-
+          No {{ target_mount }}/etc/os-release — nothing is installed there.
+          On the booted system run this with -e target_mount=/ ; from the live
+          ISO mount the layout first (mount-for-installer.yml) so the installed
+          system is assembled at {{ target_mount }}.
+        success_msg: "Installed system found at {{ target_mount }}."
+
+    - name: Derive the device-mapper names the UKI cmdline needs
+      # roles/target_mount is where these normally come from, but this playbook
+      # deliberately does not run it (no LUKS prompt, no mounting). They are a
+      # pure function of vg_name, and update-uki.j2 needs them to re-render.
+      ansible.builtin.set_fact:
+        root_mapper: "/dev/mapper/{{ vg_name | replace('-', '--') }}-root"
+        swap_mapper: "/dev/mapper/{{ vg_name | replace('-', '--') }}-swap"
+
+  roles:
+    - config_contract
+    - selinux
+
+  post_tasks:
+    - name: Rebuild UKIs, which carry their own copy of the command line
+      # A chainloaded UKI ignores grub.cfg's cmdline entirely, so flipping
+      # SELinux without this would change nothing at all on a UKI system.
+      # The role re-renders update-uki from the current vars, then runs it.
+      # BEFORE update-grub: roles/uki installs /etc/grub.d/25_uki, so grub.cfg
+      # has to be generated after it or the new UKIs miss the menu.
+      ansible.builtin.include_role:
+        name: uki
+      when: uki_enabled | bool
+
+    - name: Regenerate grub.cfg so the command line change takes effect
+      ansible.builtin.command: chroot {{ target_mount }} update-grub
+      changed_when: true
+
+    - name: Next steps
+      ansible.builtin.debug:
+        msg:
+          - >-
+            {{ 'SELinux is armed for the next boot.' if selinux_enabled | bool
+            else 'SELinux is disarmed; AppArmor takes the LSM slot at the next boot.' }}
+          - >-
+            {{ 'A full relabel is pending: the next boot relabels every filesystem and
+            then REBOOTS ITSELF once. Expect two reboots, not one.'
+            if selinux_enabled | bool and selinux_needs_relabel | default(false) | bool
+            else 'No relabel pending.' }}
+          - "Verify after the reboot with VERIFY.md section 12; operating notes in SELINUX.md."

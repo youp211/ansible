@@ -1,0 +1,113 @@
+---
+# Makes finalize independent of whatever state the installer left behind:
+# opens the container if closed, activates the VG, mounts root/boot/ESP and
+# the chroot binds. Idempotent — safe to re-run.
+
+- name: Guard — machine config present
+  ansible.builtin.assert:
+    that:
+      - target_disk | length > 0
+      - target_disk is match('^/dev/')
+    fail_msg: >-
+      target_disk is empty — set it in group_vars/all.yml before running
+      finalize (check it after replacing the tree with an update).
+
+- name: Guard — target disk node exists
+  ansible.builtin.stat:
+    path: "{{ target_disk }}"
+  register: tgt_disk_node
+
+- name: Fail if the disk node is missing
+  ansible.builtin.assert:
+    that: tgt_disk_node.stat.exists
+    fail_msg: "{{ target_disk }} does not exist on this system."
+
+- name: Compute partition name prefix
+  ansible.builtin.set_fact:
+    part_prefix: "{{ target_disk }}{{ 'p' if (target_disk | basename) is match('.*[0-9]$') else '' }}"
+    root_mapper: "/dev/mapper/{{ vg_name | replace('-', '--') }}-root"
+    swap_mapper: "/dev/mapper/{{ vg_name | replace('-', '--') }}-swap"
+
+- name: Check whether the LUKS container is already open
+  ansible.builtin.stat:
+    path: "/dev/mapper/{{ luks_name }}"
+  register: luks_map
+
+- name: Open the LUKS container (if the installer session closed it)
+  community.crypto.luks_device:
+    device: "{{ part_prefix }}3"
+    state: opened
+    name: "{{ luks_name }}"
+    passphrase: "{{ luks_passphrase }}"
+  no_log: true
+  when: not luks_map.stat.exists
+
+- name: Activate the volume group
+  ansible.builtin.command: vgchange -ay {{ vg_name }}
+  changed_when: false
+
+- name: Settle udev
+  ansible.builtin.command: udevadm settle
+  changed_when: false
+
+- name: Ensure {{ target_mount }} exists
+  ansible.builtin.file:
+    path: "{{ target_mount }}"
+    state: directory
+    mode: "0755"
+
+- name: Check whether root is already mounted at {{ target_mount }}
+  ansible.builtin.command: findmnt -no SOURCE {{ target_mount }}
+  register: tgt_src
+  changed_when: false
+  failed_when: false
+
+- name: Mount root LV at {{ target_mount }}
+  ansible.builtin.command: mount -t ext4 {{ root_mapper }} {{ target_mount }}
+  when: tgt_src.rc != 0
+  changed_when: true
+
+- name: Assert an installed system is present (installer finished?)
+  ansible.builtin.stat:
+    path: "{{ target_mount }}/etc/fstab"
+  register: tgt_fstab
+
+- name: Fail if no installed system found
+  ansible.builtin.assert:
+    that: tgt_fstab.stat.exists
+    fail_msg: >-
+      {{ target_mount }} does not contain an installed system
+      (no /etc/fstab). Run the Mint installer first, then finalize.
+
+- name: Mount /boot and the ESP inside the target
+  ansible.builtin.shell: |
+    set -e
+    mountpoint -q {{ target_mount }}/boot || mount -t ext4 {{ part_prefix }}2 {{ target_mount }}/boot
+    mkdir -p {{ target_mount }}/boot/efi
+    mountpoint -q {{ target_mount }}/boot/efi || mount -t vfat {{ part_prefix }}1 {{ target_mount }}/boot/efi
+  changed_when: true
+
+- name: Bind /dev, /proc, /sys, /run into the target for chroot work
+  ansible.builtin.shell: |
+    set -e
+    mkdir -p {{ target_mount }}/dev {{ target_mount }}/proc {{ target_mount }}/sys {{ target_mount }}/run
+    # --make-rslave after each bind: the root mount has shared propagation on
+    # systemd, so without this a bind joins the same peer group and unmount
+    # events inside {{ target_mount }} PROPAGATE BACK to the live session.
+    if ! mountpoint -q {{ target_mount }}/dev; then
+      mount --rbind /dev {{ target_mount }}/dev
+      mount --make-rslave {{ target_mount }}/dev
+    fi
+    if ! mountpoint -q {{ target_mount }}/proc; then
+      mount -t proc proc {{ target_mount }}/proc
+      mount --make-rslave {{ target_mount }}/proc
+    fi
+    if ! mountpoint -q {{ target_mount }}/sys; then
+      mount --rbind /sys {{ target_mount }}/sys
+      mount --make-rslave {{ target_mount }}/sys
+    fi
+    if ! mountpoint -q {{ target_mount }}/run; then
+      mount --bind /run {{ target_mount }}/run   # --bind, not --rbind: /run/user/* is useless in a chroot and busy at teardown
+      mount --make-rslave {{ target_mount }}/run
+    fi
+  changed_when: true

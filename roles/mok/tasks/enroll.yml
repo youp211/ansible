@@ -1,0 +1,202 @@
+---
+# mokutil --import cannot be fully automated, and that is the feature: shim
+# requires a human at the console to confirm in MokManager. What this does is
+# stage the request non-interactively so the blue screen appears at the next
+# boot and asks for the password the playbook prompted for.
+#
+# Enrollment is a firmware-level, machine-level act. Doing it from the live ISO
+# writes the same MokNew EFI variable as doing it from the booted system, which
+# is why this works at target_mount=/target as well as / — and why doing it
+# twice is harmless.
+
+- name: Check for EFI variables (MOK enrollment is firmware state, not a file)
+  ansible.builtin.stat:
+    path: /sys/firmware/efi/efivars
+  register: mok_efivars
+
+- name: Skip enrollment on a non-UEFI boot
+  ansible.builtin.debug:
+    msg: >-
+      /sys/firmware/efi/efivars is absent — this session booted in legacy BIOS
+      mode, so there is no MOK list to enroll into. The key was still generated
+      and still signs everything; enroll it from a UEFI boot with
+      "mokutil --import {{ mok_der }}".
+  when: not mok_efivars.stat.exists
+
+- name: Stage the enrollment
+  when: mok_efivars.stat.exists
+  block:
+    - name: Check whether this key is already enrolled or already pending
+      # --test-key reports enrolled keys; --list-new reports ones already staged
+      # for MokManager. Either way there is nothing to do, which is what makes
+      # a rerun a no-op instead of a second blue screen.
+      #
+      # No pipes, deliberately. "mokutil --list-new | grep -q ..." looks obvious
+      # and is wrong under `set -o pipefail`: grep -q exits at the first match,
+      # mokutil is killed by SIGPIPE writing the remaining ~90 lines, and the
+      # pipeline reports 141. The elif then reads as "not pending" and the
+      # import is re-staged on EVERY run. Measured on this hardware: rc=141 with
+      # grep -q, rc=0 with grep -c (which drains its input). Capturing into a
+      # variable and matching with `case` removes the pipeline entirely.
+      #
+      # --list-enrolled is checked first because it is authoritative and stable;
+      # --test-key and --list-new are fallbacks. --test-key changes its wording
+      # once a kernel with CONFIG_SYSTEM_TRUSTED_KEYS=<this cert> is running,
+      # which is exactly what roles/kernel builds — see the arms below.
+      ansible.builtin.shell: |
+        state=absent
+        # --list-enrolled first: it is the authoritative view of the shim
+        # MokList. NB no apostrophes in this block — ansible runs split_args()
+        # over the free-form shell string, so a lone quote even inside a comment
+        # is a parser error that --syntax-check will not catch (this file is
+        # only reached at runtime, via include_role tasks_from).
+        #
+        # 2>&1 on --test-key is load bearing: it prints its verdict on STDERR
+        # and exits 255. Discarding stderr made this probe see an empty string,
+        # decide "absent", and re-stage an import on every single run.
+        enrolled="$(mokutil --list-enrolled 2>/dev/null || true)"
+        case "$enrolled" in *"{{ mok_cn }}"*) state=enrolled ;; esac
+        if [ "$state" = absent ]; then
+          out="$(mokutil --test-key {{ target_mount }}{{ mok_der }} 2>&1 || true)"
+          case "$out" in
+            # "built-in trusted keyring" appears once a kernel built with
+            # CONFIG_SYSTEM_TRUSTED_KEYS=<this cert> is running — which is
+            # exactly what roles/kernel produces. Without this arm the role
+            # decides the key is absent and re-stages an enrollment that is
+            # already done, on every run.
+            # One arm per pattern rather than a single alternation: the
+            # ansible-lint rule risky-shell-pipe scans for the alternation
+            # character naively and would demand `set -o pipefail` for a
+            # pipeline that does not exist.
+            #
+            # There is deliberately NO arm for "built-in trusted keyring". That
+            # message means the cert is in the KERNEL keyring, via a kernel
+            # built with CONFIG_SYSTEM_TRUSTED_KEYS=<this cert> — which says
+            # nothing whatever about shim MokList. Treating it as enrolled was
+            # a wrong fix for what turned out to be the discarded-stderr bug
+            # above, and would silently skip a genuinely needed enrolment.
+            *"is already enrolled"*)                  state=enrolled ;;
+            *"is already in the enrollment request"*) state=pending ;;
+          esac
+        fi
+        if [ "$state" = absent ]; then
+          new="$(mokutil --list-new 2>/dev/null || true)"
+          case "$new" in *"{{ mok_cn }}"*) state=pending ;; esac
+        fi
+        echo "$state"
+      args:
+        executable: /bin/bash
+      register: mok_state
+      changed_when: false
+
+    - name: Report an enrollment that is already done or already staged
+      ansible.builtin.debug:
+        msg: >-
+          MOK is {{ 'already enrolled in firmware' if mok_state.stdout == 'enrolled'
+          else 'already staged — MokManager will offer it at the next boot' }};
+          nothing to do.
+      when: mok_state.stdout != 'absent'
+
+    - name: Drop the stored enrollment password once the key is confirmed enrolled
+      # Self-cleaning: the password is one-shot and MokManager has consumed it.
+      ansible.builtin.file:
+        path: "{{ target_mount }}{{ mok_dir }}/mok-enroll-password"
+        state: absent
+      when: mok_state.stdout == 'enrolled'
+
+    - name: Import the MOK so MokManager offers it at the next boot
+      when: mok_state.stdout == 'absent'
+      block:
+        - name: Generate the one-shot MokManager password
+          # Generated, not chosen. It is consumed at the blue screen on the next
+          # boot and never needed again, and its hash lands in the MokAuth EFI
+          # variable, which root can read on the running system — so nothing you
+          # care about should ever be typed there.
+          #
+          # Alphanumeric minus I l 1 O o 0: you read this off one screen and
+          # retype it into a UEFI console with no clipboard.
+          #
+          # python3's secrets module rather than `tr -dc < /dev/urandom | head`:
+          # head closes the pipe, tr takes SIGPIPE, and pipefail turns that into
+          # rc 141 — the password generates correctly and the task fails anyway.
+          ansible.builtin.command:
+            argv:
+              - python3
+              - -c
+              - >-
+                import secrets, string, sys;
+                alphabet = ''.join(c for c in string.ascii_letters + string.digits
+                                   if c not in 'Il1Oo0');
+                sys.stdout.write(''.join(secrets.choice(alphabet)
+                                 for _ in range({{ mok_password_length }})))
+          register: mok_generated
+          changed_when: false
+          no_log: true
+
+        - name: Hash it for mokutil
+          # mokutil prompts "input password:" twice and reads via getpass, so it
+          # cannot be piped — driven with pexpect instead (python3-pexpect is
+          # already in live_packages). --generate-hash touches no firmware state.
+          ansible.builtin.expect:
+            command: mokutil --generate-hash
+            responses:
+              'input password': "{{ mok_generated.stdout }}"
+          register: mok_hash
+          no_log: true
+          changed_when: false
+
+        - name: Write the password hash where mokutil can read it
+          ansible.builtin.copy:
+            dest: "{{ target_mount }}{{ mok_dir }}/.mok-hash"
+            content: "{{ mok_hash.stdout_lines | select('match', '^\\$6\\$') | first }}\n"
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+        - name: Import the certificate into the MOK list
+          # The documented non-interactive form: --hash-file consumes exactly
+          # what --generate-hash produced.
+          ansible.builtin.command: >-
+            mokutil --import {{ target_mount }}{{ mok_der }}
+            --hash-file {{ target_mount }}{{ mok_dir }}/.mok-hash
+          register: mok_import
+          changed_when: mok_import.rc == 0
+
+        - name: Keep a copy of the password for a re-run
+          # MokManager runs BEFORE any filesystem is mounted, so this copy is
+          # unreachable at the moment you need it — write the password down from
+          # the output below. It exists so that a later run can remind you, and
+          # it is deleted automatically once the key is confirmed enrolled.
+          ansible.builtin.copy:
+            dest: "{{ target_mount }}{{ mok_dir }}/mok-enroll-password"
+            content: "{{ mok_generated.stdout }}\n"
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+      always:
+        - name: Remove the password hash
+          ansible.builtin.file:
+            path: "{{ target_mount }}{{ mok_dir }}/.mok-hash"
+            state: absent
+
+    - name: Enrollment instructions
+      # Deliberately NOT no_log: the whole point is that you can read the
+      # password. It is one-shot and worthless after MokManager consumes it.
+      ansible.builtin.debug:
+        msg:
+          - "==================================================================="
+          - "  MOK ENROLLMENT PASSWORD:   {{ mok_generated.stdout }}"
+          - "  WRITE THIS DOWN NOW. MokManager runs before any filesystem is"
+          - "  mounted, so the copy kept in {{ mok_dir }} is unreachable then."
+          - "==================================================================="
+          - "Enrollment is STAGED but not finished. At the next boot:"
+          - "  1. shim shows a blue MokManager screen"
+          - "  2. Enroll MOK -> Continue -> Yes"
+          - "  3. enter the password above"
+          - "  4. Reboot"
+          - "Confirm afterwards with: mokutil --test-key {{ mok_der }}"
+          - "Miss the screen and it simply boots as before — re-run to stage a new one."
+      when: mok_state.stdout == 'absent'

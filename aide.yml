@@ -1,0 +1,33 @@
+---
+# AIDE ONLY — file integrity monitoring on an already-installed system.
+#
+#   sudo ansible-playbook aide.yml -e target_mount=/     # on the booted system
+#   sudo ansible-playbook aide.yml                       # live ISO, /target mounted
+#
+# finalize.yml runs this role itself at the end of a full run. This playbook is
+# the way back in afterwards — new exclude list, flip the per-boot check, retake
+# the baseline — without going near crypttab, GRUB or the TPM2 enrollment.
+
+- name: "AIDE: file integrity monitoring"
+  hosts: live
+  become: true
+
+  pre_tasks:
+    - name: Look for an installed system at the target mount
+      ansible.builtin.stat:
+        path: "{{ target_mount }}/etc/os-release"
+      register: aide_target_os
+
+    - name: Assert the target holds an installed system
+      ansible.builtin.assert:
+        that: aide_target_os.stat.exists
+        fail_msg: >-
+          No {{ target_mount }}/etc/os-release — nothing is installed there.
+          On the booted system run this with -e target_mount=/ ; from the live
+          ISO mount the layout first (mount-for-installer.yml) so the installed
+          system is assembled at {{ target_mount }}.
+        success_msg: "Installed system found at {{ target_mount }}."
+
+  roles:
+    - config_contract
+    - aide

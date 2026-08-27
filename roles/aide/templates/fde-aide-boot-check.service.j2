@@ -1,0 +1,18 @@
+# managed by lmde7-fde (roles/aide)
+[Unit]
+Description=AIDE integrity check of the boot chain
+Documentation=file:/usr/share/doc/aide/README.Debian.gz
+# No baseline yet (first boot, or aide_init_mode=never) means nothing to check.
+ConditionPathExists=/var/lib/aide/aide.db
+RequiresMountsFor=/var/lib/aide /boot {{ uki_esp_mount }}
+After=local-fs.target fde-aide-init.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fde-aide-boot-check
+# A finding leaves the unit failed on purpose: systemctl --failed is then the
+# one place that tells you the boot chain moved.
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

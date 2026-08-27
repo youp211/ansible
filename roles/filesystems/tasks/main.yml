@@ -1,0 +1,71 @@
+---
+- name: Format ESP as FAT32
+  community.general.filesystem:
+    dev: "{{ part_prefix }}1"
+    fstype: vfat
+    opts: "-F 32 -n ESP"
+    force: true
+
+- name: Format /boot as ext4
+  community.general.filesystem:
+    dev: "{{ part_prefix }}2"
+    fstype: ext4
+    opts: "-L boot"
+    force: true
+
+- name: Format ext4 logical volumes
+  community.general.filesystem:
+    dev: "/dev/{{ vg_name }}/{{ item.name }}"
+    fstype: ext4
+    opts: "-L {{ item.name }}"
+    force: true
+  loop: "{{ lvs | selectattr('fs', 'equalto', 'ext4') | list }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Format /home as f2fs with the fscrypt-capable feature set
+  community.general.filesystem:
+    dev: "/dev/{{ vg_name }}/home"
+    fstype: f2fs
+    opts: "-l home -O {{ f2fs_mkfs_features }}"
+    force: true
+
+- name: Make the swap LV ({{ swap_size_mib | default("fixed") }} MiB)
+  ansible.builtin.command: mkswap -L swap /dev/{{ vg_name }}/swap
+  changed_when: true
+
+# ---- fscrypt: SETUP ONLY. Creates tool config + on-filesystem metadata dirs.
+# ---- No protectors, no policies, nothing encrypted.
+
+- name: Create live-session /etc/fscrypt.conf (v2 policies)
+  when: fscrypt_configure | bool
+  ansible.builtin.command: fscrypt setup --quiet --force
+  changed_when: true
+
+- name: Mount /home LV at a staging point
+  when: fscrypt_configure | bool
+  ansible.builtin.shell: |
+    set -e
+    mkdir -p /mnt/prep-home
+    mountpoint -q /mnt/prep-home || mount -t f2fs /dev/{{ vg_name }}/home /mnt/prep-home
+  changed_when: true
+
+- name: Initialise fscrypt metadata on the /home filesystem
+  when: fscrypt_configure | bool
+  ansible.builtin.command: fscrypt setup /mnt/prep-home --quiet
+  register: fscrypt_fs
+  changed_when: fscrypt_fs.rc == 0
+  failed_when:
+    - fscrypt_fs.rc != 0
+    - "'already setup' not in (fscrypt_fs.stderr + fscrypt_fs.stdout)"
+
+- name: Confirm fscrypt sees the filesystem as setup and encryption-capable
+  when: fscrypt_configure | bool
+  ansible.builtin.command: fscrypt status /mnt/prep-home
+  register: fscrypt_stat
+  changed_when: false
+
+- name: Unmount staging point
+  when: fscrypt_configure | bool
+  ansible.builtin.command: umount /mnt/prep-home
+  changed_when: true

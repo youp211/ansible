@@ -1,0 +1,28 @@
+---
+# MOK — the one keypair that signs UKIs, kernel images and kernel modules.
+# See KERNEL.md for the chain it closes and for the MokManager reboot.
+#
+# The generation task is guarded by creates: and will NEVER overwrite an
+# existing key. Regenerating is not a rerun, it is a break — every artifact
+# already signed becomes unverifiable and the MOK enrolled in firmware stops
+# matching. Roll it by moving mok_dir aside by hand, then re-running.
+
+- name: MOK disabled (mok_enabled=false)
+  ansible.builtin.debug:
+    msg: >-
+      mok_enabled=false — no signing key is generated. uki_sign and
+      kernel_sign_image/kernel_sign_modules have nothing to sign with; set
+      mok_enabled=true, or provide {{ mok_key }} and {{ mok_cert }} yourself.
+  when: not mok_enabled | bool
+
+- name: Generate the Machine Owner Key
+  ansible.builtin.import_tasks: generate.yml
+  when: mok_enabled | bool
+
+# Enrollment is NOT imported here. Generating the key is safe everywhere and
+# finalize.yml wants it (roles/uki signs with it), but `mokutil --import`
+# writes firmware state and puts a MokManager screen in front of the next boot.
+# At finalize time the key signs nothing yet — uki_sign defaults off and no
+# custom kernel exists — so paying for that screen there would be premature.
+# kernel.yml invokes enroll.yml explicitly, after the build, which is the point
+# at which there is something signed to enroll for.

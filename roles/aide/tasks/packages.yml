@@ -1,0 +1,38 @@
+---
+# Non-fatal by design: a chroot without working DNS must not cost you the rest
+# of the run. Everything downstream is gated on aide_installed.
+
+- name: Refresh the apt index inside the target
+  ansible.builtin.command: chroot {{ target_mount }} apt-get update
+  changed_when: false
+  failed_when: false
+
+- name: Install AIDE into the target (non-fatal)
+  # The aide/aideinit debconf question defaults to false, so a noninteractive
+  # install configures the package without hashing the filesystem — the
+  # baseline is taken deliberately, later, by init.yml.
+  ansible.builtin.command: >-
+    chroot {{ target_mount }} env DEBIAN_FRONTEND=noninteractive
+    apt-get install -y {{ aide_packages | join(' ') }}
+  register: aide_apt
+  failed_when: false
+  changed_when:
+    - aide_apt.rc == 0
+    - "'0 newly installed' not in aide_apt.stdout"
+
+- name: Record whether AIDE is available in the target
+  # default() so a --check run, where the command tasks are skipped, previews
+  # cleanly instead of dying on an undefined rc.
+  ansible.builtin.set_fact:
+    aide_installed: "{{ aide_apt.rc | default(1) == 0 }}"
+
+- name: Report an AIDE install failure without aborting the run
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ aide_packages | join(', ') }} did not install into the target
+      (rc={{ aide_apt.rc | default('skipped') }}); AIDE is NOT configured. The FDE configuration is
+      unaffected. Fix networking in the target and re-run
+      "ansible-playbook aide.yml -e target_mount={{ target_mount }}".
+      Last line: {{ (aide_apt.stderr_lines | default([]) | last)
+                    | default('see apt output', true) }}
+  when: not aide_installed | bool

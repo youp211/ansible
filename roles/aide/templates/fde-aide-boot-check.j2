@@ -1,0 +1,43 @@
+#!/bin/sh
+# managed by lmde7-fde (roles/aide)
+#
+# Check the boot chain against the AIDE baseline. /boot and the ESP are the only
+# part of this machine an attacker can rewrite while it is powered off, and the
+# database they are checked against lives inside the LUKS2 container — see
+# AIDE.md.
+set -u
+
+CONFIG=/etc/aide/aide.conf
+DB=/var/lib/aide/aide.db
+LIMIT='{{ aide_boot_limit }}'
+
+if [ ! -f "$DB" ]; then
+    printf 'no AIDE baseline yet (%s missing) — skipping boot check\n' "$DB"
+    exit 0
+fi
+
+aide --config="$CONFIG" --check --limit "$LIMIT" --no-progress --no-color
+rc=$?
+
+# aide exit status: 1 = new, 2 = removed, 4 = changed entries, added together.
+# Anything above 7 is an aide error, not a finding.
+if [ "$rc" -eq 0 ]; then
+    printf 'boot chain matches the AIDE baseline (limit %s)\n' "$LIMIT"
+    exit 0
+fi
+
+if [ "$rc" -gt 7 ]; then
+    printf 'aide failed with status %d; the boot chain was NOT verified\n' "$rc"
+    exit "$rc"
+fi
+
+printf 'INTEGRITY ALERT: AIDE reported changes under %s (status %d)\n' "$LIMIT" "$rc"
+printf 'If you did not just update a kernel, initramfs or GRUB, treat this\n'
+printf 'machine as compromised. Otherwise: sudo /usr/local/sbin/fde-aide-boot-accept\n'
+{% if aide_boot_check_wall | bool %}
+if command -v wall >/dev/null 2>&1; then
+    printf 'AIDE: the boot chain (%s) does not match the baseline.\nRun: journalctl -u fde-aide-boot-check -b\n' "$LIMIT" \
+        | wall -n 2>/dev/null || true
+fi
+{% endif %}
+exit "$rc"

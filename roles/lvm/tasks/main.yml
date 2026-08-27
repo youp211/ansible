@@ -1,0 +1,24 @@
+---
+- name: Create volume group {{ vg_name }} on /dev/mapper/{{ luks_name }} (PE 4 MiB)
+  community.general.lvg:
+    vg: "{{ vg_name }}"
+    pvs: "/dev/mapper/{{ luks_name }}"
+    pesize: "4"
+
+- name: Create logical volumes (declared order — home takes 95%FREE last)
+  community.general.lvol:
+    vg: "{{ vg_name }}"
+    lv: "{{ item.name }}"
+    size: "{{ (swap_size_mib ~ 'm') if item.name == 'swap' else item.size }}"
+    shrink: false
+  loop: "{{ lvs }}"
+  loop_control:
+    label: "{{ item.name }} {{ (swap_size_mib ~ 'm') if item.name == 'swap' else item.size }}"
+
+- name: Activate all LVs
+  ansible.builtin.command: vgchange -ay {{ vg_name }}
+  changed_when: false
+
+- name: Settle udev so /dev/{{ vg_name }}/* symlinks exist
+  ansible.builtin.command: udevadm settle
+  changed_when: false

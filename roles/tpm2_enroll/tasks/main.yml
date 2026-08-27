@@ -1,0 +1,261 @@
+---
+- name: Skip note when TPM2 enrollment disabled
+  ansible.builtin.debug:
+    msg: "tpm2_enroll=false — boot will use the LUKS passphrase only."
+  when: not tpm2_enroll | bool
+
+- name: TPM2 enrollment
+  when: tpm2_enroll | bool
+  block:
+    - name: Assert a TPM2 device is present
+      ansible.builtin.stat:
+        path: /dev/tpmrm0
+      register: tpmrm_fin
+
+    - name: Fail without TPM2
+      ansible.builtin.assert:
+        that: tpmrm_fin.stat.exists
+        fail_msg: >-
+          No /dev/tpmrm0. Enable the TPM in firmware, or set tpm2_enroll=false
+          to ship passphrase-only boot.
+
+    - name: Read the LUKS container UUID
+      # Derived here rather than taken from target_config's uuid_map. That map
+      # is a target_config implementation detail holding an entry per partition
+      # and per LV, and this role needs exactly one of them — so depending on it
+      # made tpm2_enroll unusable from any playbook that does not run
+      # target_config first (tpm2.yml did not, and broke).
+      ansible.builtin.command: blkid -s UUID -o value {{ part_prefix }}3
+      register: tpm2_luks_blkid
+      changed_when: false
+
+    - name: Assert the container UUID was readable
+      ansible.builtin.assert:
+        that: tpm2_luks_blkid.stdout | trim | length > 0
+        fail_msg: >-
+          blkid returned no UUID for {{ part_prefix }}3. The initramfs unlock
+          script needs it to find the container by UUID at boot. Check that
+          target_disk ({{ target_disk }}) is right and the partition exists.
+        success_msg: "LUKS container UUID read from {{ part_prefix }}3."
+
+    - name: Install initramfs hook that ships the LUKS2 token plugin + TCTI
+      ansible.builtin.template:
+        src: fde-tpm2-token.j2
+        dest: "{{ target_mount }}/etc/initramfs-tools/hooks/fde-tpm2-token"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Ensure the initramfs local-top directory exists
+      ansible.builtin.file:
+        path: "{{ target_mount }}/etc/initramfs-tools/scripts/local-top"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install the local-top script that actually performs TPM2+PIN unlock
+      ansible.builtin.template:
+        src: fde-tpm2-unlock.j2
+        dest: "{{ target_mount }}/etc/initramfs-tools/scripts/local-top/00_fde_tpm2_unlock"
+        owner: root
+        group: root
+        mode: "0755"
+      when: tpm2_boot_unlock in ['always', 'cmdline']
+
+    - name: Remove the unlock script when tpm2_boot_unlock is never
+      ansible.builtin.file:
+        path: "{{ target_mount }}/etc/initramfs-tools/scripts/local-top/00_fde_tpm2_unlock"
+        state: absent
+      when: tpm2_boot_unlock == 'never'
+      # Filename must sort before "cryptroot": initramfs-tools builds the run
+      # ORDER with `get_prereq_pairs | tsort`, and with no declared prereq
+      # relationship independent scripts keep their (alphabetical) glob order.
+
+    - name: Detect whether this system booted via a UKI
+      # PCR 11 only exists if systemd-stub measured a UKI into it.
+      ansible.builtin.shell: |
+        set -o pipefail
+        for f in /sys/firmware/efi/efivars/StubInfo-*; do
+          [ -e "$f" ] && { echo uki; exit 0; }
+        done
+        echo no-uki
+      args:
+        executable: /bin/bash
+      register: tpm2_stub
+      changed_when: false
+
+    - name: Detect whether the initrd can supply a PCR signature
+      # A signed policy (tpm2_public_key_pcrs) needs tpm2-pcr-signature.json at
+      # unlock time. systemd-stub exposes it, but only across a systemd-initrd
+      # handoff; a script-based initramfs-tools initrd never sees it, so the
+      # policy session cannot be built and the unseal fails BEFORE the PIN is
+      # checked. The symptom is a rejected PIN with TPM2_PT_LOCKOUT_COUNTER
+      # stuck at 0 — the TPM was never asked.
+      #
+      # systemd-cryptenroll will NOT catch this for you: its safety net only
+      # runs when it finds a signature file, and on such a system there is none,
+      # so it writes an unusable keyslot without complaint.
+      ansible.builtin.shell: |
+        set -o pipefail
+        img="{{ target_mount }}/boot/initrd.img-$(uname -r)"
+        [ -e "$img" ] || { echo unknown; exit 0; }
+        if lsinitramfs "$img" 2>/dev/null | grep -qx 'usr/lib/systemd/systemd'; then
+          echo systemd
+        else
+          echo script
+        fi
+      args:
+        executable: /bin/bash
+      register: tpm2_initrd_kind
+      changed_when: false
+      when: tpm2_public_key_pcrs | length > 0
+
+    - name: Refuse a signed PCR policy the initrd cannot honour
+      ansible.builtin.assert:
+        that: tpm2_initrd_kind.stdout | trim != 'script'
+        fail_msg: >-
+          tpm2_public_key_pcrs="{{ tpm2_public_key_pcrs }}" asks for a signed PCR
+          policy, but this system boots a script-based initramfs-tools initrd,
+          which never receives the tpm2-pcr-signature.json that systemd-stub
+          hands to a systemd initrd. The keyslot would enrol without error and
+          then fail to unseal at every boot, presenting as a rejected PIN with
+          the TPM lockout counter stuck at zero. Set tpm2_public_key_pcrs="" and
+          bind PCRs directly with tpm2_pcrs, or switch to a systemd initrd
+          (dracut). See SECUREBOOT.md "Measured boot: the signed PCR policy".
+        success_msg: "Initrd can supply a PCR signature — signed policy is usable."
+      when: tpm2_public_key_pcrs | length > 0
+
+    - name: Decide whether the requested PCRs can honestly be sealed from here
+      # systemd-cryptenroll seals against the PCRs of the RUNNING system. PCR 7
+      # is machine-level (Secure Boot policy) and is therefore the same from a
+      # live ISO as it will be after boot — which is why enrolling during
+      # finalize has always worked. Binding DIRECTLY to PCR 11 is not: it measures the UKI's own
+      # sections, so sealing it from a live ISO, or from before the initramfs
+      # and UKIs are rebuilt later in this very play, binds the keyslot to a
+      # value that will never recur. The TPM then refuses to unseal and there
+      # is NO error at enrolment time to warn you.
+      #
+      # This checks tpm2_pcrs only. tpm2_public_key_pcrs is exempt by
+      # construction: a signed policy binds to a KEY, not to a live
+      # measurement, so it enrols from anywhere and survives kernel updates.
+      ansible.builtin.set_fact:
+        tpm2_can_seal: >-
+          {{ not (tpm2_pcrs is search('11'))
+             or (target_mount == '/' and tpm2_stub.stdout | trim == 'uki') }}
+
+    - name: Refuse to seal PCR 11 from an environment that is not the sealed image
+      ansible.builtin.debug:
+        msg: >-
+          SKIPPING TPM2 enrollment. tpm2_pcrs="{{ tpm2_pcrs }}" includes PCR 11,
+          which measures the UKI that is running — but this is
+          {{ 'a live/chroot run (target_mount=' ~ target_mount ~ ')'
+             if target_mount != '/' else 'not booted via a UKI' }},
+          and finalize rebuilds the initramfs and the UKIs after this point
+          anyway. Sealing here would bind the keyslot to a PCR 11 that never
+          recurs, with no error to tell you. Finish this run, reboot into the
+          UKI, then seal against the real values with:
+          "ansible-playbook tpm2.yml -e target_mount=/".
+      when: not tpm2_can_seal | bool
+
+    - name: Check whether a systemd-tpm2 token is already enrolled
+      ansible.builtin.shell: |
+        set -o pipefail
+        cryptsetup luksDump {{ part_prefix }}3 | grep -c 'systemd-tpm2' || true
+      args:
+        executable: /bin/bash
+      register: tpm2_token
+      changed_when: false
+
+    - name: Wipe existing tpm2 keyslot (re-enroll requested)
+      ansible.builtin.command: systemd-cryptenroll --wipe-slot=tpm2 {{ part_prefix }}3
+      when:
+        - tpm2_can_seal | bool
+        - tpm2_reenroll | bool
+        - tpm2_token.stdout | trim | int > 0
+      changed_when: true
+
+    - name: Enroll the TPM2 keyslot with a PIN
+      # This is the only step in the tree that needs TWO secrets at once: the
+      # recovery passphrase (to authorise against keyslot 0) and the new PIN.
+      #
+      # They are NOT passed with `environment:`. no_log censors task args and
+      # results, but it does not touch the connection plugin's EXEC line, which
+      # at -vvv prints the environment inline as
+      #     <localhost> EXEC /bin/sh -c 'NEWPIN=<the actual PIN> python3 ...'
+      # — verified, on success and on failure alike. Sourcing a 0600 file on
+      # /run (tmpfs, never written to disk) keeps both values off every command
+      # line and out of the log at any verbosity.
+      when:
+        - tpm2_can_seal | bool
+        - tpm2_reenroll | bool or (tpm2_token.stdout | trim | int == 0)
+      block:
+        - name: Stage the enrollment secrets on tmpfs
+          ansible.builtin.copy:
+            dest: /run/fde-cryptenroll.env
+            content: |
+              PASSWORD={{ luks_passphrase }}
+              NEWPIN={{ tpm2_pin }}
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+        - name: "Enroll TPM2 with PIN (PCRs {{ tpm2_pcrs }}); recovery passphrase stays in slot 0"
+          # cryptenroll-tpm2.c reads NEWPIN, not NEWPASSWORD.
+          ansible.builtin.shell: |
+            set -a
+            . /run/fde-cryptenroll.env
+            set +a
+            systemd-cryptenroll --tpm2-device=auto --tpm2-with-pin=yes \
+              --tpm2-pcrs={{ tpm2_pcrs }} \
+              {{ ('--tpm2-public-key=' ~ uki_pcr_pub ~ ' --tpm2-public-key-pcrs=' ~ tpm2_public_key_pcrs) if tpm2_public_key_pcrs | length > 0 else '' }} \
+              {{ part_prefix }}3
+          args:
+            executable: /bin/bash
+          timeout: 600
+          register: tpm2_enroll_run
+          failed_when: false
+          changed_when: tpm2_enroll_run.rc == 0
+
+        - name: Show why the TPM2 enrollment failed
+          # Safe to print: systemd-cryptenroll echoes neither secret into its
+          # own stderr, and the registered result survives no_log intact.
+          ansible.builtin.debug:
+            msg: "{{ tpm2_enroll_run.stderr_lines | default(['no stderr captured']) }}"
+          when: tpm2_enroll_run.rc | default(0) != 0
+
+        - name: Assert the TPM2 enrollment succeeded
+          ansible.builtin.assert:
+            that: tpm2_enroll_run.rc | default(0) == 0
+            fail_msg: >-
+              systemd-cryptenroll failed (rc={{ tpm2_enroll_run.rc | default('unknown') }});
+              its stderr is printed above. The usual causes are a wrong recovery
+              passphrase — it authorises the enrollment against keyslot 0 — or a
+              TPM in dictionary-attack lockout, which "tpm2_clear" from firmware
+              setup resets at the cost of every other TPM-sealed secret on the
+              machine.
+            success_msg: "TPM2 keyslot enrolled with a PIN."
+
+      always:
+        - name: Shred the staged secrets
+          ansible.builtin.file:
+            path: /run/fde-cryptenroll.env
+            state: absent
+
+    - name: Verify the token landed in the LUKS2 header
+      # Captured rather than piped into grep -q: under pipefail, grep -q exiting
+      # at the first match hands luksDump a SIGPIPE and the pipeline reports 141
+      # even on a successful match. luksDump's output is small enough to fit the
+      # pipe buffer today, so it has not bitten here — but the same construct
+      # did bite in roles/mok, so it is not left standing.
+      ansible.builtin.shell: |
+        dump="$(cryptsetup luksDump {{ part_prefix }}3)"
+        case "$dump" in *systemd-tpm2*) exit 0 ;; *) exit 1 ;; esac
+      args:
+        executable: /bin/bash
+      changed_when: false
+      # Skipped alongside the enrolment: on a fresh install where PCR 11 made
+      # sealing impossible from here there is legitimately no token yet, and
+      # this would fail a run that did nothing wrong.
+      when: tpm2_can_seal | bool
