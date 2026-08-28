@@ -1,0 +1,36 @@
+---
+# Gaming + game-streaming host tuning for LMDE 7 / Debian 13 (Intel CPU, AMD GPU,
+# Cinnamon on Xorg, Steam + Proton, Sunshine streaming to Moonlight clients).
+#
+# Design: the CPU stays on the `powersave` governor at idle/desktop, and GameMode
+# flips it to `performance` only while a game is actually running, then reverts.
+#
+# Usage:
+#   ansible-playbook site.yml --ask-become-pass --check   # dry run
+#   ansible-playbook site.yml --ask-become-pass           # apply
+#
+# The native-Sunshine build is NOT run by default (it replaces a working streaming
+# host and drops any live stream). Opt in explicitly when between sessions:
+#   ansible-playbook site.yml --ask-become-pass --tags sunshine_native
+
+- name: Optimize gaming and streaming host
+  hosts: gaming
+  gather_facts: true
+
+  roles:
+    - role: packages
+      tags: [packages]
+    - role: kernel_tuning
+      tags: [kernel, sysctl]
+    - role: cpu_power
+      tags: [cpu, power]
+    - role: gamemode
+      tags: [gamemode]
+    - role: sunshine
+      tags: [sunshine]
+    - role: steam_launch_options
+      tags: [steam, gamemode]
+    - role: mesa_backports
+      tags: [never, mesa]
+    - role: sunshine_native
+      tags: [never, sunshine_native]

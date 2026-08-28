@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Sunshine
+Comment=Self-hosted game stream host for Moonlight
+Categories=RemoteAccess;Network;
+Icon=dev.lizardbyte.app.Sunshine
+Exec=/usr/bin/sunshine
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

@@ -1,0 +1,60 @@
+#!/bin/sh
+# managed by lmde7-fde — emit a GRUB menuentry chainloading each UKI on the ESP
+#
+# Newest first, and the newest carries the fixed id "lmde-uki-latest" so
+# GRUB_DEFAULT can name it and keep naming it across kernel installs. A plain
+# glob would sort lexically, which puts lmde-6.12.101 AHEAD of lmde-7.2.0 —
+# i.e. the oldest kernel first and "latest" pointing at the wrong one.
+set -e
+
+ESP="{{ uki_esp_mount }}"
+DIR="$ESP/{{ uki_dir }}"
+REAL=/etc/grub.d/10_linux
+
+# Never emit an empty Linux menu. Under uki_boot_policy=uki-only this tree has
+# taken the executable bit off 10_linux, so if there is no UKI here to replace
+# its entries the menu would offer no way to start Linux at all — on a machine
+# that still boots far enough to look fine. Degrade to the stock entries and say
+# why. (26_fde_linux carries the same guard; if it is installed it owns the
+# fallback, or 10_linux would be run twice and every entry appear twice.)
+fallback() {
+    if [ -x /etc/grub.d/26_fde_linux ]; then exit 0; fi
+    if [ -r "$REAL" ] && [ ! -x "$REAL" ]; then
+        echo "lmde7-fde: $1 — falling back to the classic GRUB entries" >&2
+        sh "$REAL"
+    fi
+    exit 0
+}
+
+[ -d "$DIR" ] || fallback "$DIR does not exist"
+
+set -- "$DIR"/*.efi
+[ -e "$1" ] || fallback "no UKIs in $DIR"
+
+FSUUID="$(grub-probe --target=fs_uuid "$ESP" 2>/dev/null || true)"
+[ -n "$FSUUID" ] || fallback "could not probe the filesystem UUID of $ESP"
+
+# -V is version sort: 7.2.0 > 6.12.101 > 6.12.48, which plain sort gets wrong.
+first=1
+for uki in $(ls -1 "$DIR"/*.efi 2>/dev/null | sort -V -r); do
+  [ -e "$uki" ] || continue
+  base="$(basename "$uki")"
+  ver="${base%.efi}"
+  if [ "$first" = 1 ]; then
+    id="lmde-uki-latest"
+    title="LMDE UKI $ver (latest)"
+    first=0
+  else
+    id="lmde-uki-$ver"
+    title="LMDE UKI $ver"
+  fi
+  cat <<EOF
+menuentry '$title' --id '$id' {
+	insmod part_gpt
+	insmod fat
+	insmod chain
+	search --no-floppy --fs-uuid --set=root $FSUUID
+	chainloader /{{ uki_dir }}/$base
+}
+EOF
+done

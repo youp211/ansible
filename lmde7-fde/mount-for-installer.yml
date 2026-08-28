@@ -1,0 +1,98 @@
+---
+# PHASE 1.5 — run AFTER prep.yml, BEFORE launching the Mint installer.
+# Mounts the complete final layout at /target so the installer's EXPERT MODE
+# (Manual Partitioning -> "Expert mode" button) copies the system directly
+# onto the encrypted LVs. No mount-point assignment in the installer at all.
+
+- name: "Phase 1.5: assemble /target for live-installer expert mode"
+  hosts: live
+  become: true
+  vars_prompt:
+    - name: luks_passphrase
+      prompt: "LUKS recovery passphrase (only used if the container is closed)"
+      private: true
+
+  tasks:
+    - name: Guard — machine config present
+      ansible.builtin.assert:
+        that:
+          - target_disk | length > 0
+          - target_disk is match('^/dev/')
+        fail_msg: >-
+          target_disk is empty — set it in group_vars/all.yml before running
+          this play.
+
+    - name: Check whether the LUKS container is open
+      ansible.builtin.stat:
+        path: "/dev/mapper/{{ luks_name }}"
+      register: luks_map
+
+    - name: Open the LUKS container if needed
+      community.crypto.luks_device:
+        device: "{{ part_prefix }}3"
+        state: opened
+        name: "{{ luks_name }}"
+        passphrase: "{{ luks_passphrase }}"
+      no_log: true
+      when: not luks_map.stat.exists
+
+    - name: Activate the volume group
+      ansible.builtin.command: vgchange -ay {{ vg_name }}
+      changed_when: false
+
+    - name: Settle udev
+      ansible.builtin.command: udevadm settle
+      changed_when: false
+
+    - name: Mount root at {{ target_mount }}
+      ansible.builtin.shell: |
+        set -e
+        mkdir -p {{ target_mount }}
+        mountpoint -q {{ target_mount }} || mount -t ext4 /dev/{{ vg_name }}/root {{ target_mount }}
+      changed_when: true
+
+    - name: Mount /boot and the ESP
+      ansible.builtin.shell: |
+        set -e
+        mkdir -p {{ target_mount }}/boot
+        mountpoint -q {{ target_mount }}/boot || mount -t ext4 {{ part_prefix }}2 {{ target_mount }}/boot
+        mkdir -p {{ target_mount }}/boot/efi
+        mountpoint -q {{ target_mount }}/boot/efi || mount -t vfat {{ part_prefix }}1 {{ target_mount }}/boot/efi
+      changed_when: true
+
+    - name: Mount every remaining LV at its final path (parents before children)
+      ansible.builtin.shell: |
+        set -e
+        mkdir -p {{ target_mount }}{{ item.mount }}
+        mountpoint -q {{ target_mount }}{{ item.mount }} || \
+          mount -t {{ item.fs }} /dev/{{ vg_name }}/{{ item.name }} {{ target_mount }}{{ item.mount }}
+      loop: "{{ lvs | rejectattr('name', 'in', ['root', 'swap']) | list }}"
+      loop_control:
+        label: "{{ item.name }} -> {{ item.mount }}"
+      changed_when: true
+
+    - name: Enforce mountpoint permissions before the installer copies in
+      ansible.builtin.file:
+        path: "{{ target_mount }}{{ item.mount }}"
+        state: directory
+        mode: "{{ '1777' if item.mount in ['/tmp', '/var/tmp']
+                  else ('0700' if item.mount == '/var/log/audit' else '0755') }}"
+      loop: "{{ lvs | rejectattr('name', 'in', ['root', 'swap']) | list }}"
+      loop_control:
+        label: "{{ item.mount }}"
+
+    - name: Show the assembled tree
+      ansible.builtin.command: findmnt -R {{ target_mount }}
+      register: tree
+      changed_when: false
+
+    - name: Next steps
+      ansible.builtin.debug:
+        msg:
+          - "{{ tree.stdout_lines }}"
+          - "Now launch expert mode from a terminal (required — the GUI"
+          - "does not expose it):  sudo live-installer-expert-mode"
+          - "Everything is already mounted at /target — just proceed and Install."
+          - "At 'Installation paused' simply continue; finalize.yml does all"
+          - "chroot work including the bootloader. When done: DO NOT REBOOT,"
+          - "run finalize.yml."

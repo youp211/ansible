@@ -1,0 +1,127 @@
+---
+# TPM2 KEYSLOT GUARD — run BEFORE anything rebuilds a UKI.
+#
+# Rebuilding an image changes what systemd-stub measures into PCR 11. If the
+# LUKS2 keyslot is sealed against PCR 11, the seal is now against a value that
+# will never occur again, and NOTHING FAILS DURING THE RUN: the playbook reports
+# success, and at the next boot the machine asks for the PIN and rejects the
+# correct one. The tell is TPM2_PT_LOCKOUT_COUNTER staying 0x0 — the TPM never
+# got as far as counting a wrong guess, because the policy did not match.
+#
+# So the probe reads the LUKS2 header rather than trusting tpm2_pcrs: what
+# matters is what is actually enrolled, which may predate the current config.
+#
+# PCR 7 is the safe case and the common one. It covers Secure Boot policy and
+# the certificate that authorised the image — not the image itself — so an image
+# re-signed by the same key leaves it untouched. secureboot.yml is what moves
+# it, and tpm2.yml is the answer there.
+
+- name: Look for a TPM2 keyslot this run could invalidate
+  # Probes devices, not the installed tree, so no chroot: block devices are
+  # global and roles/tpm2_enroll reads them the same way. Reads only.
+  ansible.builtin.shell: |
+    set -o pipefail
+    all=""
+    for dev in $(blkid -t TYPE=crypto_LUKS -o device 2>/dev/null); do
+      ids="$(cryptsetup luksDump "$dev" 2>/dev/null \
+             | sed -n 's/^  \([0-9]\+\): systemd-tpm2$/\1/p')"
+      for id in $ids; do
+        # The token JSON is unambiguous ("tpm2-pcrs":[7]); the human-readable
+        # luksDump line formats multiple PCRs in a way worth not parsing.
+        pcrs="$(cryptsetup token export --token-id "$id" "$dev" 2>/dev/null \
+                | sed -n 's/.*"tpm2-pcrs":\[\([^]]*\)\].*/\1/p')"
+        echo "$dev token $id -> PCRs ${pcrs:-none}" >&2
+        all="$all,$pcrs"
+      done
+    done
+    echo "$all" | tr ',' '\n' | grep -E '^[0-9]+$' | sort -un | paste -sd, -
+  args:
+    executable: /bin/bash
+  register: uki_tpm2_probe
+  changed_when: false
+  failed_when: false
+
+- name: Record which PCRs the enrolled keyslots are sealed against
+  ansible.builtin.set_fact:
+    uki_tpm2_bound: "{{ (uki_tpm2_probe.stdout | trim).split(',') | select | map('int') | list }}"
+
+- name: Work out whether rebuilding the images would break the seal
+  ansible.builtin.set_fact:
+    uki_tpm2_at_risk: "{{ uki_tpm2_bound | select('in', uki_image_measured_pcrs) | list }}"
+
+- name: No TPM2 keyslot to protect
+  ansible.builtin.debug:
+    msg: >-
+      No systemd-tpm2 token found in any LUKS2 header, so rebuilding the UKIs
+      cannot invalidate one.
+  when: uki_tpm2_bound | length == 0
+
+- name: TPM2 keyslot is unaffected by this run
+  ansible.builtin.debug:
+    msg: >-
+      TPM2 keyslot is sealed against PCR(s) {{ uki_tpm2_bound | join(', ') }},
+      none of which depend on which image booted. Rebuilding and re-signing the
+      UKIs with the same key leaves those values alone, so PIN unlock keeps
+      working. (PCR 7 moves for Secure Boot and firmware key changes —
+      secureboot.yml — not for this.)
+  when:
+    - uki_tpm2_bound | length > 0
+    - uki_tpm2_at_risk | length == 0
+
+- name: This run WILL invalidate the TPM2 keyslot
+  when: uki_tpm2_at_risk | length > 0
+  block:
+    - name: Spell out exactly what breaks
+      ansible.builtin.debug:
+        msg:
+          - "STOP — the TPM2 keyslot is sealed against PCR(s) {{ uki_tpm2_at_risk | join(', ') }}."
+          - "Those PCRs measure the image itself, and this run rebuilds it."
+          - "After it, the machine will ASK for the PIN at the next boot and REJECT"
+          - "the correct one. Nothing will fail during this run."
+          - "Your recovery passphrase still unlocks the container — it is in a"
+          - "separate keyslot and is not sealed to anything."
+          - "The fix afterwards is to boot the new image and re-seal:"
+          - "    sudo ansible-playbook tpm2.yml -e target_mount=/"
+          - "Set uki_tpm2_guard=ignore in group_vars to stop being asked."
+
+    - name: Refuse to continue (uki_tpm2_guard=fail)
+      ansible.builtin.fail:
+        msg: >-
+          Aborting: rebuilding the UKIs would invalidate the TPM2 keyslot sealed
+          against PCR(s) {{ uki_tpm2_at_risk | join(', ') }}, and
+          uki_tpm2_guard=fail. Re-run with uki_tpm2_guard=prompt to decide
+          interactively, or plan to run tpm2.yml after the next boot. See
+          BOOTPOLICY.md and tpm2.yml's header.
+      when: uki_tpm2_guard == 'fail'
+
+    - name: Ask before invalidating it (uki_tpm2_guard=prompt)
+      # One when: on the block, not one per task. The assert reads
+      # uki_tpm2_answer.user_input, and a when: list short-circuits in order —
+      # a per-task guard would evaluate that register before the condition meant
+      # to prevent it from being evaluated. Same trap as roles/secureboot.
+      when: uki_tpm2_guard == 'prompt'
+      block:
+        - name: Wait for a decision
+          ansible.builtin.pause:
+            prompt: |
+
+              The TPM2 keyslot is sealed against PCR(s) {{ uki_tpm2_at_risk | join(', ') }},
+              which this run will change. PIN unlock will stop working at the next
+              boot; the recovery passphrase will not. Re-seal afterwards with
+              "ansible-playbook tpm2.yml -e target_mount=/".
+
+              Type yes to continue, anything else to abort
+          register: uki_tpm2_answer
+
+        - name: Honour the answer
+          ansible.builtin.assert:
+            that: uki_tpm2_answer.user_input | trim | lower == 'yes'
+            fail_msg: >-
+              Aborted at the TPM2 guard — nothing was rebuilt and the keyslot is
+              untouched. (If you did not answer: ansible.builtin.pause returns
+              an EMPTY answer when stdin is not a terminal, so a piped or
+              non-interactive run always lands here. That is the safe direction
+              — it cannot say yes on your behalf. Use uki_tpm2_guard=ignore for
+              unattended runs where you have already decided.)
+            success_msg: >-
+              Confirmed. Rebuilding; remember to run tpm2.yml after the next boot.

@@ -1,0 +1,175 @@
+---
+# secureboot_mode: append-mok — leave the factory hierarchy alone and add ONE
+# certificate to db: the MOK that signs this machine's UKIs.
+#
+# Why this rather than owning the keys, on a dual-boot box: db must keep
+# "Microsoft Corporation UEFI CA 2011" anyway, because that CA signs the GOP
+# driver in this machine's discrete GPU option ROM (verified — see SECUREBOOT.md
+# "The option ROM that decides this"). Once that CA is in db it also vouches for
+# shim and every other third-party loader, so a custom hierarchy would end up
+# trusting the same set as the factory one and buy nothing.
+#
+# Nothing here writes a firmware variable. It CANNOT: appending to db outside
+# setup mode needs an update signed by a KEK we do not hold (the board vendor
+# does). Staging the certificate where the firmware's own file browser can read
+# it is the whole job; the append itself is a deliberate keystroke in firmware
+# setup, which is exactly where a db change belongs.
+
+- name: Assert the MOK exists before staging it
+  # Rule 6: the fix goes in the message. Without the MOK there is nothing to
+  # append, and appending the wrong thing costs a second firmware trip.
+  ansible.builtin.stat:
+    path: "{{ target_mount }}{{ item }}"
+  register: sb_mok_files
+  loop:
+    - "{{ mok_cert }}"
+    - "{{ mok_der }}"
+
+- name: Fail early if the MOK has not been generated
+  ansible.builtin.assert:
+    that: sb_mok_files.results | map(attribute='stat.exists') | select('false') | list | length == 0
+    fail_msg: >-
+      {{ sb_mok_files.results | rejectattr('stat.exists') | map(attribute='item') | join(', ') }}
+      missing. roles/mok generates the MOK; run kernel.yml (or finalize.yml with
+      mok_enabled=true) before staging it for db. See KERNEL.md.
+    success_msg: "MOK present — {{ mok_cert }} and {{ mok_der }}."
+
+# check_mode: false on every probe below. Ansible skips shell/command under
+# --check, which would leave the registers empty and make the UKI assert fail
+# with "no UKIs found" on a machine that has plenty. These tasks only read
+# state — they are already changed_when: false — so running them under --check
+# is both safe and the only way --check reports the truth.
+- name: Check whether the MOK is already in the firmware db
+  # Rule 4: reruns are a feature. Once the key is appended this reports it and
+  # the staging below becomes a no-op copy, so a rerun is changed=0.
+  #
+  # mokutil --db reads the firmware variable, not MokList — that distinction is
+  # the whole point here. A MOK in MokList is trusted by SHIM; a MOK in db is
+  # trusted by FIRMWARE, which is what boots the UKI directly.
+  ansible.builtin.shell: |
+    set -o pipefail
+    out="$(mokutil --db 2>/dev/null || true)"
+    printf '%s' "$out" | grep -c 'CN *= *{{ mok_cn }}' || true
+  args:
+    executable: /bin/bash
+  register: sb_mok_in_db
+  changed_when: false
+  check_mode: false
+
+- name: Prove the MOK verifies the UKIs before asking anyone to trust it
+  # The append-mok mirror of secureboot_require_bootable. Appending a
+  # certificate that does not verify this machine's own boot images is the one
+  # mistake here that costs a second firmware trip, and it is preventable.
+  # Every UKI is checked, not just the newest: uki_retain keeps older images as
+  # the fallback, and one that firmware will not load is a fallback that is not
+  # there when it is needed.
+  #
+  # Paths are target_mount-prefixed and the glob is expanded HERE rather than
+  # inside a chroot, so this reads the target's ESP whether target_mount is /
+  # or /target. Reporting basenames keeps the staged ENROLL-MOK.txt readable
+  # and free of the "//boot/efi" that a prefixed "/" would otherwise produce.
+  ansible.builtin.shell: |
+    set -o pipefail
+    shopt -s nullglob
+    rc=0
+    for u in {{ target_mount }}{{ uki_esp_mount }}/{{ uki_dir }}/*.efi; do
+      if sbverify --cert {{ target_mount }}{{ mok_cert }} "$u" >/dev/null 2>&1; then
+        echo "OK   $(basename "$u")"
+      else
+        echo "FAIL $(basename "$u")"
+        rc=1
+      fi
+    done
+    exit $rc
+  args:
+    executable: /bin/bash
+  register: sb_uki_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Assert every UKI on the ESP verifies against the MOK
+  ansible.builtin.assert:
+    that:
+      - sb_uki_check.stdout_lines | length > 0
+      - sb_uki_check.rc == 0
+    fail_msg: >-
+      {{ 'No UKIs found in ' ~ uki_esp_mount ~ '/' ~ uki_dir ~ ' — there is nothing
+      for firmware to boot once Secure Boot is on. Build them first (uki_enabled +
+      uki_sign, see KERNEL.md).'
+      if sb_uki_check.stdout_lines | length == 0
+      else 'These UKIs are not signed by ' ~ mok_cert ~ ', so firmware would refuse
+      them even with the MOK in db: '
+      ~ (sb_uki_check.stdout_lines | select('match', '^FAIL') | join('; '))
+      ~ '. Re-run the uki role to sign them, or delete the stale images.' }}
+      Override with secureboot_require_bootable=false only if you know why.
+    success_msg: >-
+      All {{ sb_uki_check.stdout_lines | length }} UKI(s) verify against
+      {{ mok_cn }} — appending it to db makes them bootable.
+  when: secureboot_require_bootable | bool
+
+- name: Create the key staging directory on the ESP
+  # On the ESP, not in secureboot_dir: the firmware's file browser reads the ESP
+  # and nothing else. secureboot_dir lives on the root LV inside LUKS2, which
+  # firmware cannot see at the point where you are appending a key.
+  ansible.builtin.file:
+    path: "{{ target_mount }}{{ uki_esp_mount }}/{{ secureboot_esp_key_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Stage the MOK certificate for the firmware key browser
+  # Under --check this reports "Destination directory does not exist" until the
+  # first real run: check mode only PRETENDS to create the directory above. Not
+  # a bug and not worth guarding — the assert that matters (every UKI verifies)
+  # has already run by this point, which is what --check is useful for here.
+  #
+  # Two names, same DER bytes. Vendor firmwares filter the browser by extension
+  # and do not agree on which one to offer: ASUS lists .cer, others .der. Two
+  # 1.3 KiB copies is a cheaper hedge than a second trip to the firmware because
+  # the file you staged did not appear in the list.
+  ansible.builtin.copy:
+    src: "{{ target_mount }}{{ mok_der }}"
+    dest: "{{ target_mount }}{{ uki_esp_mount }}/{{ secureboot_esp_key_dir }}/{{ item }}"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0600"
+  loop:
+    - MOK.cer
+    - MOK.der
+
+- name: Read the MOK fingerprint to check against what firmware displays
+  # The firmware key browser shows a fingerprint, not a subject line. Without
+  # this to compare against, "append the right file" is a guess.
+  ansible.builtin.shell: |
+    set -o pipefail
+    openssl x509 -in {{ target_mount }}{{ mok_cert }} -noout -fingerprint -sha256 \
+      | sed 's/.*=//'
+  args:
+    executable: /bin/bash
+  register: sb_mok_fp
+  changed_when: false
+  check_mode: false
+
+- name: Stage the enrolment instructions beside the certificate
+  # The firmware trip happens with no shell and no notes. Put the steps on the
+  # ESP where a second machine (or the firmware's own file browser) can read
+  # them, including the fingerprint to check against what the firmware shows.
+  ansible.builtin.template:
+    src: ENROLL-MOK.txt.j2
+    dest: "{{ target_mount }}{{ uki_esp_mount }}/{{ secureboot_esp_key_dir }}/ENROLL-MOK.txt"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: The MOK is already in db — nothing left to do in firmware
+  ansible.builtin.debug:
+    msg: >-
+      db already contains "{{ mok_cn }}", so firmware will load the UKIs. If
+      Secure Boot is still off, turn it on in firmware setup — and expect one
+      recovery-passphrase boot afterwards, because enabling Secure Boot moves
+      PCR 7 and the TPM2 keyslot is sealed to it. Re-seal with:
+      sudo ansible-playbook tpm2.yml -e target_mount=/
+  when: sb_mok_in_db.stdout | trim | int > 0

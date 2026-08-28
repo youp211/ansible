@@ -1,0 +1,58 @@
+managed by lmde7-fde (roles/secureboot/tasks/stage_mok.yml) — do not edit here
+===============================================================================
+ lmde7-fde — append the Machine Owner Key to the firmware db
+ Host: {{ inventory_hostname }}
+===============================================================================
+
+WHAT THIS IS
+  The factory Secure Boot hierarchy on this machine stays exactly as it
+  shipped. One certificate is added to db: the key that signs this machine's
+  Unified Kernel Images. Nothing is cleared and nothing is replaced.
+
+  After the append, db trusts:
+    - the board vendor's keys          (unchanged)
+    - Microsoft's CAs                  (unchanged) -> Windows, and the GPU
+                                                      option ROM, keep working
+    - {{ mok_cn }}   <- ADDED -> the UKI boots
+
+THE CERTIFICATE
+  File   \{{ secureboot_esp_key_dir | replace('/', '\\') }}\MOK.cer
+         (identical bytes are also at MOK.der, for firmware whose file
+         browser filters on that extension instead)
+  Subject  CN={{ mok_cn }}
+  SHA-256  {{ sb_mok_fp.stdout | trim }}
+
+  Check that fingerprint against what the firmware shows before confirming.
+  It is the only thing that distinguishes the right file from a wrong one.
+
+STEPS (ASUS wording; other vendors differ in labels, not in substance)
+  1. Reboot into firmware setup.
+  2. Secure Boot -> Key Management.
+  3. Select "db Management" (Authorized Signatures).
+  4. Choose APPEND, not Replace/Set New. Replace wipes the vendor and
+     Microsoft certificates and would leave Windows and the GPU option ROM
+     untrusted.
+  5. Browse to the file above on this ESP and confirm.
+  6. Verify the fingerprint matches the line above.
+  7. Set Secure Boot to Enabled. Save and exit.
+
+AFTER THE REBOOT
+  Expect the LUKS recovery passphrase ONCE. Enabling Secure Boot changes
+  PCR 7, and the TPM2 keyslot is sealed to PCR 7, so it will not unseal until
+  it is re-sealed against the new value. Re-seal from the UKI you intend to
+  keep booting:
+
+      sudo ansible-playbook tpm2.yml -e target_mount=/
+
+  Then confirm the whole picture with VERIFY.md.
+
+IF SOMETHING WILL NOT BOOT
+  Turn Secure Boot off in firmware setup. Everything boots again, including
+  the shim/GRUB entries. Nothing in this procedure is one-way: the appended
+  certificate can be deleted from db in the same menu, and "Restore factory
+  keys" puts db back exactly as it shipped.
+
+WHAT WAS VERIFIED BEFORE THIS FILE WAS WRITTEN
+{% for line in sb_uki_check.stdout_lines %}
+  {{ line }}
+{% endfor %}

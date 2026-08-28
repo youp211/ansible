@@ -1,0 +1,69 @@
+#!/bin/sh
+# managed by lmde7-fde — classic kernel entries, filtered to UKI-backed kernels
+#
+# Installed only when uki_boot_policy is "uki-backed". /etc/grub.d/10_linux has
+# had its executable bit removed (see roles/uki/tasks/boot_policy.yml), so
+# grub-mkconfig skips it and this script runs it by hand instead, dropping the
+# entries for kernels that have no signed UKI on the ESP.
+#
+# Why re-run the real 10_linux rather than emit entries ourselves: it owns
+# linux_entry(), the search --fs-uuid preamble, GRUB_CMDLINE_LINUX assembly,
+# grub_quote and the recovery variant. Reimplementing that here would be a
+# second copy to keep in step with grub upstream forever. "sh <file>" needs only
+# the read bit, and this script is a child of grub-mkconfig, so it inherits the
+# same exported GRUB_* environment the real invocation would have had.
+#
+# Numbered 26, i.e. AFTER 25_uki, deliberately: the signed entries come first,
+# so GRUB_DEFAULT=0 selects a UKI without this tree having to own GRUB_DEFAULT.
+set -e
+
+REAL=/etc/grub.d/10_linux
+DIR="{{ uki_esp_mount }}/{{ uki_dir }}"
+
+[ -r "$REAL" ] || exit 0
+
+# Allow-list: the kernel versions that actually have an image on the ESP.
+versions=""
+for u in "$DIR"/lmde-*.efi; do
+    [ -e "$u" ] || continue
+    b="${u##*/}"
+    b="${b%.efi}"
+    versions="$versions ${b#lmde-}"
+done
+
+# Never emit an empty Linux menu. If the ESP has no UKIs — first run, a failed
+# ukify, an unmounted ESP — filtering would delete every remaining way to start
+# Linux from the menu. Degrade to the stock entries instead and say so.
+if [ -z "$versions" ]; then
+    echo "lmde7-fde: no UKIs in $DIR — emitting UNFILTERED classic entries" >&2
+    sh "$REAL"
+    exit 0
+fi
+
+# Buffer each menuentry block to its closing brace AT THE SAME INDENTATION, so
+# this stays correct whether or not GRUB_DISABLE_SUBMENU=y has nested the
+# entries inside an "Advanced options" submenu. A block with no vmlinuz- in it
+# is not a kernel entry and is passed through untouched.
+sh "$REAL" | awk -v ok="$versions" '
+BEGIN {
+    n = split(ok, a, " ")
+    for (i = 1; i <= n; i++) keep[a[i]] = 1
+}
+!inentry && /^[ \t]*menuentry / {
+    inentry = 1
+    ind = match($0, /[^ \t]/) - 1
+    buf = $0 ORS
+    ver = ""
+    next
+}
+inentry {
+    buf = buf $0 ORS
+    if (match($0, /vmlinuz-[^ \t]+/)) ver = substr($0, RSTART + 8, RLENGTH - 8)
+    if ($0 ~ /^[ \t]*\}[ \t]*$/ && match($0, /[^ \t]/) - 1 == ind) {
+        inentry = 0
+        if (ver == "" || ver in keep) printf "%s", buf
+    }
+    next
+}
+{ print }
+'

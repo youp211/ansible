@@ -1,0 +1,106 @@
+---
+# Configuration + autostart for the NATIVE Sunshine build (see sunshine_native
+# for how it is compiled and installed). The flatpak is superseded and is no
+# longer configured or autostarted here.
+
+- name: Ensure native Sunshine config directory exists
+  become: false
+  ansible.builtin.file:
+    path: "/home/{{ target_user }}/.config/sunshine"
+    state: directory
+    owner: "{{ target_user }}"
+    group: "{{ target_user }}"
+    mode: "0755"
+
+# Matches the host panel to the client's actual request for the duration of a
+# stream. Without it a 4K host rendering for a 1080p client produces ~4x the
+# pixels and ~2.4x the frames the client ever sees.
+- name: Install Sunshine display mode helper
+  become: true
+  ansible.builtin.template:
+    src: sunshine-display-mode.j2
+    dest: /usr/local/bin/sunshine-display-mode
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Configure native Sunshine
+  become: false
+  ansible.builtin.copy:
+    dest: "/home/{{ target_user }}/.config/sunshine/sunshine.conf"
+    owner: "{{ target_user }}"
+    group: "{{ target_user }}"
+    mode: "0644"
+    content: |
+      # Managed by Ansible (gaming-host). See PERFORMANCE-NOTES.md.
+      min_log_level = 2
+      min_threads = 4
+      vaapi_strict_rc_buffer = enabled
+
+      # Hardware encode. Confirm the profiles your GPU actually offers with
+      # `vainfo` before trusting this.
+      encoder = {{ sunshine_encoder }}
+
+      # X11, NOT kms - deliberate, do not "optimize" this back to kms without
+      # reading this first.
+      #
+      # KMS capture works and is lower latency, but under Xorg the mouse cursor
+      # lives on a separate DRM plane and never appears in the stream. Verified
+      # Verified: with capture=kms the cursor was invisible; with x11 it is
+      # composited into the frame and visible. Sunshine has a built-in guard
+      # that avoids KMS under X11 for exactly this reason, but setting
+      # capture=kms explicitly overrides that guard.
+      #
+      # The CPU argument for KMS mostly evaporated once global_prep_cmd started
+      # dropping the host to the client's 1080p: X11 capture measured ~12% CPU
+      # at 1080p, versus 30-73% back when it was capturing 4K. Not worth losing
+      # the cursor over.
+      #
+      # KMS becomes the right choice again on Wayland, where the cursor is
+      # composited normally.
+      capture = x11
+
+      # Drop the host panel to the client's resolution/refresh while streaming,
+      # and restore the desktop mode afterwards. The helper is a no-op if the
+      # client sends no resolution or asks for a mode the output lacks.
+      global_prep_cmd = {{ sunshine_prep_cmd }}
+  notify: Warn about Sunshine restart
+
+- name: Ensure autostart directory exists
+  become: false
+  ansible.builtin.file:
+    path: "/home/{{ target_user }}/.config/autostart"
+    state: directory
+    owner: "{{ target_user }}"
+    group: "{{ target_user }}"
+    mode: "0755"
+
+# Plain Cinnamon/XDG autostart, launching the binary directly.
+#
+# The packaged systemd user unit is deliberately NOT used: it is
+# WantedBy=graphical-session.target, and Cinnamon on LMDE never activates that
+# target. Verified after a reboot - the unit reported "enabled" but stayed
+# inactive and the streaming host was simply down. An autostart entry also
+# inherits DISPLAY, XAUTHORITY, DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR
+# from the session for free, which the systemd unit had to be fed by hand.
+- name: Autostart Sunshine from the Cinnamon session
+  become: false
+  ansible.builtin.copy:
+    src: sunshine-autostart.desktop
+    dest: "/home/{{ target_user }}/.config/autostart/sunshine-native.desktop"
+    owner: "{{ target_user }}"
+    group: "{{ target_user }}"
+    mode: "0644"
+
+- name: Remove superseded flatpak autostart entry
+  become: false
+  ansible.builtin.file:
+    path: >-
+      /home/{{ target_user }}/.config/autostart/dev.lizardbyte.app.Sunshine.desktop
+    state: absent
+
+- name: Remove superseded systemd-based autostart helper
+  become: true
+  ansible.builtin.file:
+    path: /usr/local/bin/sunshine-session-start
+    state: absent

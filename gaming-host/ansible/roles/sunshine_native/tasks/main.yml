@@ -1,0 +1,156 @@
+---
+# Native Sunshine build - see PERFORMANCE-NOTES.md.
+#
+# Why this exists. The flatpak Sunshine cannot do KMS capture at all - the sandbox
+# cannot grant CAP_SYS_ADMIN, so it hard-fails and falls back to X11 grab. That
+# fallback does frame capture + colorspace conversion on the CPU, which is where
+# Sunshine's 30-73% CPU (scaling with on-screen motion) actually came from - not
+# from encoding, which was already on the GPU via VAAPI.
+#
+# NOTE: KMS capture is NOT actually in use. It was proven to work here (the log
+# reported "Screencasting with KMS"), but under Xorg the mouse cursor lives on a
+# separate DRM plane and never reaches the stream, so the desktop cursor is
+# invisible. The `sunshine` role therefore sets capture = x11. Once the host was
+# switched to render at the client's 1080p, X11 capture measured ~10-12% CPU, so
+# the latency/CPU argument for KMS no longer justified losing the cursor.
+#
+# So what does the native build still buy, honestly? No flatpak sandbox limits,
+# a working uinput/udev path for gamepads, the ability to hold capabilities, and
+# KMS available immediately if this box ever moves to Wayland (where the cursor
+# composites normally). It was not the performance win it was first framed as.
+#
+# Still tagged opt-in: re-running it rebuilds and replaces a working streaming
+# host, which drops any live stream.
+
+- name: Install Sunshine build dependencies
+  become: true
+  ansible.builtin.apt:
+    name:
+      - build-essential
+      - cmake
+      - ninja-build
+      - git
+      - pkg-config
+      - nodejs
+      - npm
+      - libboost-filesystem-dev
+      - libboost-locale-dev
+      - libboost-log-dev
+      - libboost-program-options-dev
+      - libavdevice-dev
+      - libcap-dev
+      - libcurl4-openssl-dev
+      - libdrm-dev
+      - libevdev-dev
+      - libminiupnpc-dev
+      - libnotify-dev
+      - libnuma-dev
+      - libopus-dev
+      - libpipewire-0.3-dev
+      - libpulse-dev
+      - libssl-dev
+      - libva-dev
+      - libvdpau-dev
+      - libvulkan-dev
+      - libwayland-dev
+      - libx11-dev
+      - libxcb-shm0-dev
+      - libxcb-xfixes0-dev
+      - libxcb1-dev
+      - libxfixes-dev
+      - libxrandr-dev
+      - libxtst-dev
+      - glslang-tools        # Vulkan shader compiler (glslangValidator)
+      # Ships /usr/share/pkgconfig/{systemd,udev}.pc. WITHOUT this the build
+      # silently omits the uinput udev rule and the systemd user unit, which
+      # breaks gamepad input over Moonlight. libsystemd-dev/libudev-dev alone
+      # are NOT enough - they do not provide those .pc files.
+      - systemd-dev
+    state: present
+    update_cache: true
+
+# The Mesa backports upgrade moves libgbm1 to 26.1.2, so the matching -dev
+# package must come from backports too or apt tries to downgrade the runtime.
+- name: Install Mesa dev headers matching the backports runtime
+  become: true
+  ansible.builtin.apt:
+    name: libgbm-dev
+    state: present
+    default_release: trixie-backports
+
+- name: Clone Sunshine source
+  become: false
+  ansible.builtin.git:
+    repo: https://github.com/LizardByte/Sunshine.git
+    dest: "/home/{{ target_user }}/src/Sunshine"
+    version: master
+    depth: 1
+    recursive: true
+
+# TRAY=OFF avoids pulling in a full Qt5/Qt6 stack for a tray icon that failed to
+# create under the flatpak anyway. DOCS=OFF avoids a Doxygen >= 1.10 requirement.
+- name: Configure Sunshine build
+  become: false
+  ansible.builtin.command:
+    cmd: >-
+      cmake -G Ninja -B build -S .
+      -DCMAKE_BUILD_TYPE=Release
+      -DCMAKE_INSTALL_PREFIX=/usr
+      -DSUNSHINE_ASSETS_DIR=share/sunshine
+      -DSUNSHINE_ENABLE_WAYLAND=ON
+      -DSUNSHINE_ENABLE_X11=ON
+      -DSUNSHINE_ENABLE_DRM=ON
+      -DSUNSHINE_ENABLE_VAAPI=ON
+      -DSUNSHINE_ENABLE_CUDA=OFF
+      -DSUNSHINE_ENABLE_TRAY=OFF
+      -DBUILD_TESTS=OFF
+      -DBUILD_DOCS=OFF
+    chdir: "/home/{{ target_user }}/src/Sunshine"
+    creates: "/home/{{ target_user }}/src/Sunshine/build/build.ninja"
+
+# niced so a rebuild cannot starve a running game of CPU.
+- name: Build Sunshine
+  become: false
+  ansible.builtin.command:
+    cmd: nice -n 19 ninja -C build
+    chdir: "/home/{{ target_user }}/src/Sunshine"
+  register: sunshine_native_build
+  changed_when: "'ninja: no work to do' not in sunshine_native_build.stdout"
+
+- name: Package Sunshine as a .deb
+  become: false
+  ansible.builtin.command:
+    cmd: cpack -G DEB
+    chdir: "/home/{{ target_user }}/src/Sunshine/build"
+  register: sunshine_native_cpack
+  changed_when: sunshine_native_cpack.rc == 0
+
+- name: Install Sunshine package
+  become: true
+  ansible.builtin.apt:
+    deb: "/home/{{ target_user }}/src/Sunshine/build/cpack_artifacts/Sunshine.deb"
+    state: present
+
+# The entire point of the native build. Without it KMS capture fails exactly the
+# way it does inside the flatpak sandbox.
+- name: Grant CAP_SYS_ADMIN for KMS capture
+  become: true
+  community.general.capabilities:
+    path: /usr/bin/sunshine
+    capability: cap_sys_admin+p
+    state: present
+
+# The packaged systemd user unit is deliberately left disabled - it is
+# WantedBy=graphical-session.target, which Cinnamon on LMDE never activates.
+# Config and autostart are owned by the `sunshine` role, which uses a plain
+# Cinnamon/XDG autostart entry instead.
+- name: Disable packaged systemd user unit (superseded by Cinnamon autostart)
+  become: false
+  ansible.builtin.systemd_service:
+    name: app-dev.lizardbyte.app.Sunshine.service
+    scope: user
+    enabled: false
+    daemon_reload: true
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid | default(1000) }}"
+  failed_when: false

@@ -1,0 +1,48 @@
+---
+- name: Read back what firmware now holds
+  # Globs, and grep -c rather than grep -q: -c drains its input, so pipefail
+  # cannot trip on a SIGPIPE the way an early-exiting consumer would.
+  ansible.builtin.shell: |
+    set -o pipefail
+    read_var() {
+      for f in /sys/firmware/efi/efivars/"$1"-*; do
+        [ -e "$f" ] || continue
+        od -An -tu1 "$f" | awk '{print $5}'
+        return
+      done
+      echo "?"
+    }
+    echo "SetupMode=$(read_var SetupMode) SecureBoot=$(read_var SecureBoot)"
+    for v in pk kek db; do
+      out="$(mokutil --$v 2>/dev/null || true)"
+      printf '%s=%s cert(s)\n' "$v" "$(printf '%s' "$out" | grep -c 'Subject:' || true)"
+    done
+  args:
+    executable: /bin/bash
+  register: sb_state
+  changed_when: false
+  check_mode: false
+
+- name: Secure Boot summary
+  ansible.builtin.debug:
+    msg:
+      - "{{ sb_state.stdout_lines }}"
+      - >-
+        {{ 'Certificate staged at ' ~ uki_esp_mount ~ '/' ~ secureboot_esp_key_dir ~
+        '/MOK.cer with the steps in ENROLL-MOK.txt beside it. Nothing was written to
+        firmware — appending to db outside setup mode needs a KEK-signed update this
+        machine does not hold, so the append is a keystroke in firmware setup:
+        Key Management -> db Management -> APPEND (never Replace, which would drop
+        the vendor and Microsoft certificates that Windows and the GPU option ROM
+        depend on).'
+        if secureboot_mode == 'append-mok'
+        else ('Hierarchy enrolled. Next: enable Secure Boot in firmware, boot the UKI,
+        then re-enrol TPM2.'
+        if secureboot_enroll | bool
+        else 'Keys generated and staged; nothing written to firmware. Re-run with
+        secureboot_enroll=true while the firmware is in setup mode to commit.') }}
+      - >-
+        Enabling Secure Boot changes PCR 7, so the TPM2 keyslot sealed to it will
+        not unseal: expect the recovery passphrase once, then re-seal with
+        "sudo ansible-playbook tpm2.yml -e target_mount=/".
+      - "Recovery at any point: firmware setup -> Restore factory keys. Nothing here is one-way."

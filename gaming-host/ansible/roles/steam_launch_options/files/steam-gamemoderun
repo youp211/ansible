@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Add `gamemoderun %command%` to the Steam launch options of installed games.
+
+Managed by Ansible (gaming-host). See PERFORMANCE-NOTES.md.
+
+Why this is not a one-liner:
+
+* Steam rewrites localconfig.vdf from memory when it exits, so any edit made
+  while Steam is running is silently discarded. This refuses to run in that
+  case rather than appearing to succeed.
+* App IDs appear in at least five sections of localconfig.vdf (depots,
+  friends, WebStorage/apps, apps, and Software/Valve/Steam/apps). Matching on
+  the app ID alone hit 39 blocks for 22 games during development. Only
+  UserLocalConfigStore/Software/Valve/Steam/apps is correct, so this tracks
+  the section path while scanning.
+* Proton builds and Steam Linux Runtimes appear as "installed apps" but are
+  tools, not games, and must not be wrapped.
+
+Idempotent: exits reporting no change when every game already has it.
+
+Usage:
+  steam-gamemoderun [--check] [--steam-root DIR]
+    --check   report what would change, write nothing
+"""
+
+import argparse
+import glob
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+SECTION = "UserLocalConfigStore/Software/Valve/Steam/apps"
+OPTION = "gamemoderun %command%"
+
+# Tools that show up as installed apps but must never be wrapped.
+TOOL_PATTERNS = (
+    re.compile(r"^Proton\b", re.I),
+    re.compile(r"^Steam Linux Runtime", re.I),
+    re.compile(r"^Steamworks Common", re.I),
+)
+
+
+def steam_running():
+    return subprocess.run(["pgrep", "-x", "steam"],
+                          capture_output=True).returncode == 0
+
+
+def installed_games(steam_root):
+    """Map appid -> name for installed apps that are actually games."""
+    games = {}
+    pattern = os.path.join(steam_root, "steamapps", "appmanifest_*.acf")
+    for path in glob.glob(pattern):
+        try:
+            text = open(path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        appid = re.search(r'"appid"\s+"(\d+)"', text)
+        name = re.search(r'"name"\s+"([^"]*)"', text)
+        if not appid or not name:
+            continue
+        if any(p.match(name.group(1)) for p in TOOL_PATTERNS):
+            continue
+        games[appid.group(1)] = name.group(1)
+    return games
+
+
+def patch(path, appids, check):
+    """Set LaunchOptions on the given appids. Returns (changed, skipped)."""
+    lines = open(path, encoding="utf-8", errors="surrogateescape").read().split("\n")
+    out, stack, changed, skipped = [], [], [], []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        m = re.match(r'^"([^"]+)"$', stripped)
+        is_block = bool(m) and i + 1 < len(lines) and lines[i + 1].strip() == "{"
+
+        if is_block and "/".join(stack) == SECTION and m.group(1) in appids:
+            appid = m.group(1)
+            indent = re.match(r"^(\t*)", line).group(1)
+            out.append(line)
+            out.append(lines[i + 1])
+            j, depth, body = i + 2, 1, []
+            while j < len(lines):
+                t = lines[j].strip()
+                depth += t.count("{") - t.count("}")
+                if depth == 0:
+                    break
+                body.append(lines[j])
+                j += 1
+
+            idx = next((k for k, b in enumerate(body)
+                        if re.match(r'^\t+"LaunchOptions"\s+"', b)), None)
+            if idx is None:
+                body.insert(0, f'{indent}\t"LaunchOptions"\t\t"{OPTION}"')
+                changed.append(appid)
+            else:
+                cur = re.match(r'^\t+"LaunchOptions"\s+"(.*)"$', body[idx])
+                val = cur.group(1) if cur else ""
+                if "gamemoderun" in val:
+                    skipped.append(appid)
+                elif val.strip():
+                    # Preserve whatever is already there; only prepend.
+                    body[idx] = f'{indent}\t"LaunchOptions"\t\t"gamemoderun {val}"'
+                    changed.append(appid)
+                else:
+                    body[idx] = f'{indent}\t"LaunchOptions"\t\t"{OPTION}"'
+                    changed.append(appid)
+
+            out.extend(body)
+            out.append(lines[j])
+            i = j + 1
+            continue
+
+        if is_block:
+            stack.append(m.group(1))
+        elif stripped == "}" and stack:
+            stack.pop()
+        out.append(line)
+        i += 1
+
+    if changed and not check:
+        shutil.copy2(path, f"{path}.bak.{int(time.time())}")
+        new = "\n".join(out)
+        if new.count("{") != new.count("}"):
+            print("ERROR: brace mismatch after edit, refusing to write",
+                  file=sys.stderr)
+            return None, None
+        open(path, "w", encoding="utf-8", errors="surrogateescape").write(new)
+
+    return changed, skipped
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--steam-root",
+                    default=os.path.expanduser("~/.local/share/Steam"))
+    args = ap.parse_args()
+
+    configs = glob.glob(os.path.join(args.steam_root, "userdata", "*",
+                                     "config", "localconfig.vdf"))
+    if not configs:
+        print("no localconfig.vdf found; nothing to do")
+        return 0
+
+    games = installed_games(args.steam_root)
+    if not games:
+        print("no installed games found; nothing to do")
+        return 0
+
+    # Dry pass first, so the Steam-running check happens BEFORE any write.
+    pending = {}
+    for cfg in configs:
+        changed, _ = patch(cfg, set(games), check=True)
+        if changed is None:
+            return 1
+        if changed:
+            pending[cfg] = changed
+
+    total = sum(len(v) for v in pending.values())
+    for appid in (a for v in pending.values() for a in v):
+        print(f"  {'would set' if args.check else 'set'}: "
+              f"{appid} {games.get(appid, '')}")
+
+    # A no-op run is safe even while Steam is up; only a write is a problem.
+    if total and steam_running():
+        print("ERROR: Steam is running. It rewrites localconfig.vdf on exit, "
+              "so this edit would be discarded.\n"
+              "       Close Steam (steam -shutdown), re-run, then start Steam.",
+              file=sys.stderr)
+        return 1
+
+    if total and not args.check:
+        for cfg in pending:
+            if patch(cfg, set(games), check=False)[0] is None:
+                return 1
+
+    print(f"CHANGED={total} games={len(games)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

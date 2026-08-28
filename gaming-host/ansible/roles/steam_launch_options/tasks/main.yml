@@ -1,0 +1,37 @@
+---
+# Wraps every installed Steam game in `gamemoderun` so GameMode actually
+# engages. Without this GameMode is inert no matter how well it is configured:
+# a game must request it, and Steam has no global launch-options setting.
+#
+# Safe to run while Steam is up *if* nothing needs changing; the helper refuses
+# to write in that case rather than making an edit Steam would discard on exit.
+
+- name: Install Steam launch-options helper
+  become: true
+  ansible.builtin.copy:
+    src: steam-gamemoderun
+    dest: /usr/local/bin/steam-gamemoderun
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Apply gamemoderun to installed Steam games
+  become: false
+  ansible.builtin.command:
+    cmd: >-
+      /usr/local/bin/steam-gamemoderun
+      {{ '--check' if ansible_check_mode else '' }}
+  register: steam_launch_options_result
+  changed_when: "'CHANGED=0' not in steam_launch_options_result.stdout"
+  failed_when:
+    - steam_launch_options_result.rc != 0
+    # Steam being up is a "come back later", not a broken playbook.
+    - "'Steam is running' not in steam_launch_options_result.stderr"
+
+- name: Note that Steam must be closed to apply launch options
+  ansible.builtin.debug:
+    msg: >-
+      Launch options still need applying, but Steam is running and would
+      discard the edit on exit. Close Steam (steam -shutdown), then re-run:
+      ansible-playbook site.yml --tags steam
+  when: steam_launch_options_result.rc != 0

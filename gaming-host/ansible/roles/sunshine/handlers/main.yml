@@ -1,0 +1,10 @@
+---
+# Deliberately does not restart Sunshine: that drops any live stream. Surface it
+# instead and let the operator pick the moment.
+- name: Warn about Sunshine restart
+  ansible.builtin.debug:
+    msg: >-
+      Sunshine config changed. Restart it to apply
+      (this WILL drop an in-progress stream):
+      pkill -x sunshine && (DISPLAY=:0 setsid nohup /usr/bin/sunshine
+      >/dev/null 2>&1 </dev/null &)

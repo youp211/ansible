@@ -1,0 +1,715 @@
+---
+# =============================================================================
+# lmde7-fde configuration surface (single source of truth)
+# Target: LMDE 7 "Gigi" (Debian 13/trixie base), UEFI, single-disk FDE
+# =============================================================================
+
+# --- REQUIRED: destructive-run interlock -------------------------------------
+# prep.yml refuses to run unless ALL THREE match reality. SET THESE FIRST.
+#
+# BY-ID, NOT /dev/nvmeXn1. NVMe enumeration order is not stable across reboots:
+# on the machine this was written for, two same-size drives swapped names after a
+# single firmware trip and /dev/nvme0n1 became the OTHER operating system's disk.
+# Neither interlock catches that — identical capacities satisfy
+# expected_disk_size_gib either way, and confirm_disk_wipe is already true. A
+# by-id path is bound to the drive's serial and cannot swap.
+# Find yours with: ls -l /dev/disk/by-id/nvme-*
+target_disk: "/dev/disk/by-id/nvme-<model>_<serial>"
+
+# Partition naming, derived once here instead of being re-derived by a set_fact
+# in four separate places (rule 1). Three conventions, and by-id is the reason
+# this is not a one-liner any more:
+#   /dev/sda      -> sda1        (bare suffix)
+#   /dev/nvme0n1  -> nvme0n1p1   ("p" when the name ends in a digit)
+#   /dev/disk/by-id/nvme-... -> ...-part1   ("-part", and the name ends in a
+#                                            letter, so the digit test is wrong)
+part_prefix: >-
+  {{ target_disk ~ ('-part' if target_disk is match('^/dev/disk/')
+     else ('p' if (target_disk | basename) is match('.*[0-9]$') else '')) }}
+expected_disk_size_gib: 1863 # a marketing "2 TB" drive is 1863 GiB, not 2048.
+                             # Recompute for your disk:
+                             #   lsblk -bdno SIZE <disk>  -> bytes // 2^30
+confirm_disk_wipe: false    # must be explicitly true; prep DESTROYS the disk
+min_disk_size_gib: 512       # preflight refuses anything smaller
+
+# Optional extra paranoia: fill the disk with random data before LUKS format so
+# unused space is indistinguishable from data. Slow (hours on large disks).
+prefill_random: false
+
+# --- Identity ----------------------------------------------------------------
+vg_name: mint-debian13       # device-mapper will render this as mint--debian13-<lv>
+luks_name: cryptroot         # /dev/mapper/cryptroot holds the LVM PV
+
+# --- Partition map (exact MiB; GPT; 1 MiB alignment) -------------------------
+# p1 ESP   : start 1 MiB   size 1024 MiB  -> sectors 2048..2099199
+# p2 /boot : start 1025 MiB size 1024 MiB -> start sector 2099200
+# p3 LUKS  : start 2049 MiB -> end of disk (start sector 4196352)
+esp_size_mib: 1024
+boot_size_mib: 1024
+
+# --- LUKS2 container ---------------------------------------------------------
+luks_cipher: aes-xts-plain64
+luks_key_size: 512
+luks_pbkdf_algorithm: argon2id
+luks_pbkdf_memory_kib: 1048576   # 1 GiB memory-hard
+luks_pbkdf_time_s: 4             # target unlock cost per attempt
+luks_sector_size: 4096
+luks_allow_discards: false       # TRIM through FDE leaks allocation patterns
+
+# --- Logical volumes (created in list order; home MUST stay last) ------------
+# Fixed sizes total 136 GiB (root..tmp); swap is computed separately (see
+# swap_size_mode below) and /home takes 95%FREE of what remains.
+# LVM uses binary units: 64g == 65536 MiB exactly (PE size 4 MiB).
+# fs_pass: fsck pass for fstab. mount_opts: CIS 1.1.x option sets.
+lvs:
+  - { name: root,          size: "64g",     fs: ext4, mount: "/",              mount_opts: "defaults,errors=remount-ro",  fs_pass: 1 }
+  - { name: var,           size: "32g",     fs: ext4, mount: "/var",           mount_opts: "defaults,nodev,nosuid",       fs_pass: 2 }
+  - { name: var_log,       size: "16g",     fs: ext4, mount: "/var/log",       mount_opts: "defaults,nodev,nosuid,noexec", fs_pass: 2 }
+  - { name: var_log_audit, size: "8g",      fs: ext4, mount: "/var/log/audit", mount_opts: "defaults,nodev,nosuid,noexec", fs_pass: 2 }
+  - { name: var_tmp,       size: "8g",      fs: ext4, mount: "/var/tmp",       mount_opts: "defaults,nodev,nosuid,noexec", fs_pass: 2 }
+  - { name: tmp,           size: "8g",      fs: ext4, mount: "/tmp",           mount_opts: "defaults,nodev,nosuid,noexec", fs_pass: 2 }
+  - { name: swap,          size: "64g",     fs: swap, mount: "none",           mount_opts: "sw",                          fs_pass: 0 }   # size used only when swap_size_mode: fixed
+  - { name: home,          size: "95%FREE", fs: f2fs, mount: "/home",          mount_opts: "defaults,nodev,nosuid",       fs_pass: 2 }
+
+# Non-LV mounts written into the final fstab
+boot_mount_opts: "defaults,nodev,nosuid,noexec"
+esp_mount_opts: "umask=0077,nodev,nosuid,noexec"
+shm_mount_opts: "defaults,nodev,nosuid,noexec"
+
+# f2fs: 'encrypt' enables fscrypt; the rest are standard modern metadata features.
+f2fs_mkfs_features: "extra_attr,inode_checksum,sb_checksum,encrypt"
+
+# --- fscrypt (SETUP ONLY — no directories are encrypted, no policies applied) -
+fscrypt_install_pam: false    # install libpam-fscrypt so login-unlock works later
+# Set false (or -e fscrypt_configure=false) to skip ALL fscrypt tasks. Useful on
+# a rerun where you have already configured fscrypt by hand, since the setup
+# step runs `fscrypt setup --force`, which rewrites /etc/fscrypt.conf.
+# Protectors and policies live in filesystem metadata and are never touched.
+fscrypt_configure: false
+
+# --- Swap sizing / hibernation -----------------------------------------------
+# fixed : use the size on the 'swap' entry in the lvs list below.
+# ram   : swap = swap_ram_multiplier x exact physical RAM bytes (lsmem total
+#         online memory), rounded up to a whole MiB. 2x on a 32 GiB box gives
+#         exactly 64 GiB. Preflight computes, prints, and fit-checks it.
+swap_size_mode: ram
+swap_ram_multiplier: 2       # int or float; must be >= 1 when hibernating
+hibernate_enabled: false      # wires resume= on the kernel cmdline + initramfs
+# NOTE: with Secure Boot ON, stock Debian/LMDE kernels enter lockdown and
+# refuse hibernation. Pick one: SB on (no hibernate) or SB off (hibernate).
+
+# --- TPM2 enrollment (systemd-cryptenroll, PIN required at boot) -------------
+tpm2_enroll: true
+# PCR 7 measures Secure Boot POLICY — db/KEK/PK/dbx, the SB state, and the cert
+# used to verify each image. It does NOT measure which image booted, so on its
+# own an attacker can roll back to an older signed kernel and still unseal.
+# PCR 11 (the UKI's own sections) closes that, but binding to it DIRECTLY means
+# every kernel change invalidates the keyslot. The signed PCR policy below binds
+# PCR 11 to a KEY instead of a value, so kernel updates re-sign themselves and no
+# re-enrolment is needed. Hence: 7 direct, 11 via signature.
+tpm2_pcrs: "7"
+# PCRs covered by the signed policy (uki_pcr_sign must be on to produce it).
+# Empty disables the signed binding entirely.
+# EMPTY on this machine. A signed policy needs the signature JSON present at
+# unlock time, and systemd-stub only hands it to a SYSTEMD initrd. This box runs
+# a script-based initramfs-tools initrd, so the signature never reaches
+# cryptsetup, the policy session cannot be built, and the unseal fails BEFORE the
+# PIN is checked — the symptom is "PIN rejected" with a TPM lockout counter that
+# never moves. Requires switching to dracut (or another systemd initrd) to use.
+tpm2_public_key_pcrs: ""
+tpm2_reenroll: true         # true = wipe existing tpm2 slot and enroll fresh
+# Hard-fail finalize if the rebuilt initramfs is missing the systemd-tpm2
+# token plugin (the one piece needing on-device verification — see VERIFY.md).
+# The recovery passphrase boots the system either way.
+tpm2_require_initramfs_token: true
+tpm2_boot_tries: 3           # PIN attempts before falling back to the passphrase
+# When the boot-time TPM2+PIN unlock runs:
+#   always  - every boot prompts for the PIN (passphrase remains the fallback)
+#   cmdline - only when "fde_tpm2" is on the kernel cmdline (safe-test mode:
+#             press "e" in GRUB and append it, so a plain reboot is unaffected)
+#   never   - do not install the unlock script at all
+tpm2_boot_unlock: cmdline
+# Plymouth (boot splash) OFF by default: strips "splash" and adds
+# plymouth.enable=0 to the kernel cmdline. Besides preference, this makes the
+# unlock/passphrase prompt strictly more reliable — with no plymouth running,
+# /lib/cryptsetup/askpass talks to the console directly instead of proxying
+# through the splash daemon.
+boot_disable_plymouth: true
+# Also drop "quiet" so boot messages are visible. Off by default (cosmetic).
+boot_strip_quiet: false
+
+# --- GRUB / kernel hardening -------------------------------------------------
+kernel_cmdline_hardening: >-
+  init_on_alloc=1 init_on_free=1 slab_nomerge page_alloc.shuffle=1
+  randomize_kstack_offset=on pti=on vsyscall=none fde_tpm2
+grub_disable_os_prober: true
+# Optional GRUB menu-edit password. Generate with grub-mkpasswd-pbkdf2 and put
+# the full "grub.pbkdf2.sha512...." string here. Empty = disabled. See README.
+grub_password_pbkdf2: ""
+grub_superuser: "grubadmin"
+
+# --- UKI (Unified Kernel Images via GRUB chainload) --------------------------
+# Confirmed booting on this machine (firmware -> UKI direct, and via the GRUB
+# chainload entry as fallback), so it is on. Leave it false while installing
+# from media — there is no signing key and no ESP layout yet at that point.
+uki_enabled: true
+uki_esp_mount: /boot/efi
+uki_dir: EFI/Linux           # UKIs land in <esp>/EFI/Linux/
+# How many images to keep: the current kernel and two rollbacks. Newest-first,
+# so what ages out is the oldest.
+#
+# KNOW WHAT AGING OUT MEANS under uki_boot_policy: uki-only — a kernel with no
+# UKI has no menu entry AT ALL, because the classic entry it used to fall back
+# to is gone. It is still installed and still in /boot; it is just not offered.
+# That is the deliberate trade: a bounded rollback surface instead of an
+# unbounded one. Set 0 to keep one image per installed kernel instead.
+#
+# THE ESP IS A REAL LIMIT either way. Each UKI is a kernel plus a FULL initramfs
+# — ~181 MiB apiece here (12.3 MiB kernel + 154.1 MiB initramfs) against a
+# 1022 MiB ESP, so three fit comfortably and about five is the ceiling. Rather
+# than fill it and write a truncated image, update-uki sizes each build against
+# df, builds newest-first, and skips what will not fit while keeping
+# uki_esp_min_free_mib in reserve. Watch for "skipped N image(s) for space".
+#
+# The initramfs is 89% of every image, because initramfs.conf ships
+# MODULES=most. MODULES=dep would roughly triple how many fit, and is also the
+# classic way to get an initramfs that cannot find root after a hardware change.
+#
+# THE TRADE-OFF, stated: every retained UKI is signed and therefore bootable
+# from the firmware menu, and PCR 7 cannot tell two of them apart. Each one you
+# keep is a kernel CVE you keep as a rollback target for whoever is at the
+# keyboard. Three is the balance between that and having a way back.
+uki_retain: 3
+# Headroom the ESP must keep free. grub-install, shim and a fallback bootloader
+# all live there too, and an ESP with no slack is a failed update later.
+uki_esp_min_free_mib: 64
+
+# Guard against silently invalidating a TPM2 keyslot by rebuilding the images it
+# is sealed against. What happens when it goes wrong is not an error at run
+# time: the playbook succeeds, and the machine asks for the PIN at the next boot
+# and rejects the correct one, because the TPM never got as far as counting a
+# wrong guess (TPM2_PT_LOCKOUT_COUNTER stays 0x0 — that is how this was
+# diagnosed the first time).
+#
+#   prompt  probe the LUKS header, and if the enrolled token is bound to a PCR
+#           this run would move, stop and ask before touching anything
+#   fail    same probe, refuse outright — for unattended runs
+#   ignore  probe and warn only
+uki_tpm2_guard: prompt
+# PCRs whose values depend on WHICH IMAGE booted, i.e. the ones a UKI rebuild
+# moves. 11 is the one that matters here: systemd-stub measures the UKI's own
+# sections (.linux, .initrd, .cmdline, ...) into it, so any rebuild changes it.
+# 4 is the loaded image hash, 8/9 the kernel cmdline and initrd as measured by
+# GRUB on the classic path. PCR 7 is deliberately NOT here — it is Secure Boot
+# policy plus the certificate that authorised the image, so it survives a
+# rebuild signed by the same key and moves for secureboot.yml instead.
+uki_image_measured_pcrs: [4, 8, 9, 11]
+
+# Which entries GRUB is allowed to offer. Three tiers on one axis, not three
+# switches — see BOOTPOLICY.md.
+#
+#   all         every kernel in /boot, classic + recovery, plus the UKIs.
+#               The stock Debian menu. Use while installing from media, or
+#               whenever uki_enabled is false.
+#   uki-backed  UKIs first, then classic entries only for kernels that HAVE a
+#               UKI. Keeps single-user recovery mode; drops entries for any
+#               kernel whose image the ESP could not hold.
+#   uki-only    UKIs and nothing else.
+#
+# Anything but "all" works by taking the executable bit off /etc/grub.d/10_linux
+# (grub-mkconfig gates each drop-in on "test -x") and pinning that mode with
+# dpkg-statoverride, because 10_linux is a conffile and dpkg would otherwise
+# restore 0755 on the next grub-common upgrade — silently re-enabling every
+# classic entry during a security update.
+#
+# Does NOT touch 30_os_prober: a Windows entry survives uki-only. Does NOT
+# delete kernels: /boot is untouched, the images are simply not offered.
+uki_boot_policy: uki-only
+
+# Signed PCR policy. systemd-measure predicts PCR 11 for each UKI at build time
+# and signs it; ukify embeds the signature (.pcrsig) and the public key
+# (.pcrpkey). The TPM then unseals for any PCR 11 state signed by this key, so a
+# kernel update re-signs itself and the keyslot keeps working untouched.
+# A THIRD key, distinct from the MOK and from PK/KEK on purpose — see
+# SECUREBOOT.md "Measured boot: the signed PCR policy".
+uki_pcr_sign: true
+uki_pcr_key: /etc/uki/keys/pcr-sign.key
+# Deliberately NOT /etc/systemd/tpm2-pcr-public-key.pem. systemd-cryptenroll
+# AUTO-DISCOVERS a key at that name under /etc/systemd/, /run/systemd/ or
+# /usr/lib/systemd/ when --tpm2-public-key is not given — so parking it there
+# means omitting the flag does not disable the signed policy, it silently
+# enables it. That is exactly how a keyslot got re-bound to an unusable signed
+# policy after tpm2_public_key_pcrs was set to "". Keep it off the search path
+# and pass it explicitly when it is actually wanted.
+uki_pcr_pub: /etc/uki/keys/pcr-sign.pub
+uki_pcr_key_bits: 2048
+# Boot phases to sign for. Empty = ukify's default set, which covers
+# enter-initrd — the phase the LUKS unlock actually happens in.
+uki_pcr_phases: ""
+uki_sign: true               # sbsign with the MOK; roles/mok generates it for you
+# Aliases, not second definitions: mok_key/mok_cert below are the canonical
+# paths, and the same key signs UKIs, kernel images and modules. Change it in
+# one place (the MOK block) and every consumer follows.
+uki_sign_key: "{{ mok_key }}"
+uki_sign_cert: "{{ mok_cert }}"
+
+# Maintain a firmware boot entry pointing at the NEWEST UKI, refreshed on every
+# kernel install (the filename carries the version, so a static entry goes stale).
+# uki_efi_default puts it first in BootOrder, i.e. the machine boots the UKI
+# DIRECTLY — no shim, no GRUB. That is what lets Secure Boot work on a box whose
+# db has had the Microsoft 3rd-party UEFI CA removed: firmware verifies a binary
+# signed by your own key instead of one signed by a CA you deliberately dropped.
+# UEFI falls through to the next BootOrder entry if the UKI fails to load, so
+# shim/GRUB stays the automatic fallback.
+uki_efi_entry: true
+uki_efi_label: "LMDE UKI (latest)"
+uki_efi_default: true
+
+# --- AIDE (file integrity monitoring) ----------------------------------------
+# Detection for the one surface FDE leaves open: the unencrypted /boot + ESP.
+# The database lives on the var LV, i.e. inside the LUKS2 container, so an
+# attacker who can rewrite /boot cannot rewrite the hashes it is measured
+# against. Full rationale and the day-to-day workflow: AIDE.md.
+aide_enabled: true
+aide_packages:
+  - aide
+  - aide-common
+  - liblockfile-bin          # dotlockfile: the daily check's lock, else it warns
+
+# Trees pruned from the check. These are AIDE regexes (anchored at the start of
+# the path), not shell globs, and they are applied as non-recursive negative
+# rules — AIDE does not descend into them at all. Shorten the list to widen
+# coverage; every entry here is a place changes will NOT be reported.
+aide_exclude_paths:
+  - /home                    # f2fs, user churn; the noise would drown the report
+  - /tmp
+  - /var/tmp
+  - /var/cache
+  - /var/lib/flatpak
+  - /var/lib/systemd/coredump
+
+# What the per-boot check and the accept helper cover. /boot/efi is under /boot,
+# so this one regex catches the kernel, the initramfs, grub.cfg and the ESP.
+aide_boot_limit: "^/boot"
+aide_boot_check: true        # fde-aide-boot-check.service on every boot
+aide_boot_check_wall: true   # also wall(1) the alarm to logged-in terminals
+# Re-baseline /boot from the kernel and initramfs hooks, so your own updates do
+# not leave the boot check permanently red.
+aide_boot_accept_on_kernel_update: true
+aide_accept_hook_dirs:
+  - /etc/kernel/postinst.d   # kernel installed (runs after zz-update-grub)
+  - /etc/kernel/postrm.d     # kernel removed
+  - /etc/initramfs/post-update.d   # any update-initramfs run
+
+# When the baseline is taken:
+#   firstboot - fde-aide-init.service runs aideinit on the first boot of the
+#               installed system (correct: finalize rebuilds the initramfs and
+#               grub.cfg after the roles run, so a chroot baseline is stale)
+#   now       - run aideinit during this play; sensible on a booted system
+#               (aide.yml -e target_mount=/), slow and imprecise in a chroot
+#   never     - configure AIDE but take no baseline
+aide_init_mode: firstboot
+
+# Debian's whole-system daily check (dailyaidecheck.timer, 01:50 + 2 h jitter).
+aide_daily_enabled: true
+aide_daily_command: update   # check | update; update refreshes aide.db.new free
+aide_daily_copynewdb: "no"   # no | yes | ifnochange. "yes" accepts every change
+                             # silently after reporting it once — do not.
+aide_mailto: root            # only reachable once an MTA is installed; until
+                             # then reports live in /var/log/aide/aide.log
+aide_require_config_check: true   # hard-fail if aide --config-check rejects it
+
+# --- Secrets policy ----------------------------------------------------------
+# Three secrets exist in this tree and they are deliberately DIFFERENT values.
+# The handling is uniform (private prompt, confirm where the value is being set,
+# no_log on every task that touches one, minimum length asserted before any of
+# it is used); the values are not. See README "Secrets".
+#
+#   luks_passphrase  keyslot 0, argon2id. The offline break-glass: it is what
+#                    protects the disk when the machine is off and it is what
+#                    you fall back to when the TPM refuses. Long.
+#   tpm2_pin         typed at EVERY boot, so it is shoulder-surfable and people
+#                    pick short ones. Safe to be short only because the TPM's
+#                    dictionary-attack lockout rate-limits it — a protection
+#                    that does NOT extend to the LUKS keyslot. Reusing the
+#                    passphrase here would mean one observed boot hands over
+#                    full offline access to the disk.
+#   mok_enroll_password  one-shot. Consumed at the MokManager screen on the next
+#                    boot and never needed again, and its hash lands in the
+#                    root-readable MokAuth EFI variable. So it is GENERATED, not
+#                    chosen — nothing you care about should ever be typed there.
+luks_passphrase_min_length: 12
+tpm2_pin_min_length: 6
+# Generated alphanumeric, minus the glyphs that are ambiguous when you read them
+# off one screen and type them into a UEFI console (I l 1 O o 0).
+mok_password_length: 6
+
+# --- MOK (Machine Owner Key: signs UKIs, kernel images and modules) -----------
+# One RSA keypair, generated once and NEVER regenerated by a rerun — every UKI,
+# kernel and module already signed would become unverifiable and the enrolled
+# MOK in firmware would stop matching. Roll it by moving mok_dir aside by hand.
+# Full story, including the MokManager reboot: KERNEL.md.
+mok_enabled: true
+mok_dir: /etc/uki/keys        # on the root LV, i.e. inside the LUKS2 container
+mok_key: /etc/uki/keys/MOK.key    # private key, mode 0600
+mok_cert: /etc/uki/keys/MOK.crt   # PEM cert: sbsign, CONFIG_SYSTEM_TRUSTED_KEYS
+mok_der: /etc/uki/keys/MOK.der    # DER cert: the form mokutil enrolls
+mok_pem: /etc/uki/keys/MOK.pem    # key+cert concatenated: CONFIG_MODULE_SIG_KEY
+mok_cn: "lmde7-fde Machine Owner Key"
+mok_days: 3650
+mok_key_bits: 4096
+# Let kernel.yml stage "mokutil --import" so shim offers the enrollment at the
+# next boot. finalize.yml never enrolls whatever this says — it only generates
+# the key, because at that point the key signs nothing and the MokManager screen
+# would be premature. The
+# password is GENERATED and printed once — write it down before rebooting,
+# because MokManager runs before the disk is mounted and the copy kept at
+# {{ mok_dir }}/mok-enroll-password is unreachable at that point. That copy is
+# deleted automatically on the first run after the key is confirmed enrolled.
+# Enrollment is a firmware-level, machine-level act — doing it from the live ISO
+# and from the booted system are the same thing, and doing it twice is
+# harmless.
+# FALSE on this machine, deliberately. MokList is shim's database, and after
+# roles/secureboot took over the platform keys this box boots the UKI directly
+# from firmware — shim is not in the chain, so MokManager never runs and a
+# staged import would sit in MokNew forever, re-staged on every run. (Clearing
+# the firmware keys also wiped MokList, so the probe correctly reports the key
+# as absent; it is the enrolment that is pointless, not the detection.)
+# Set true if you go back to a shim/GRUB boot path.
+mok_enroll: true
+
+# --- Secure Boot -------------------------------------------------------------
+# Master switch. false leaves the factory hierarchy alone and stages nothing,
+# so the machine boots what its vendor and Microsoft vouched for — and its own
+# UKIs are not among them.
+secureboot_enabled: true
+
+# WHICH ROUTE. Full rationale and the evidence for choosing between them:
+# SECUREBOOT.md.
+#
+#   own-keys    Replace the factory PK/KEK/db with your own, so firmware loads
+#               nothing you did not sign. db gets the MOK, which already signs
+#               the UKIs, so the images on the ESP become bootable without
+#               rebuilding anything. Needs setup mode: clear the Secure Boot
+#               keys in firmware first.
+#
+#   append-mok  Leave the factory hierarchy exactly as it shipped and add ONE
+#               certificate to db — the MOK. Writes no firmware variable (it
+#               cannot: an append outside setup mode needs a KEK-signed update
+#               that only the board vendor can produce), so the role stages the
+#               certificate on the ESP and prints the firmware steps.
+#
+# Pick append-mok when db has to keep a vendor or Microsoft CA anyway. The
+# common reason is an option ROM: a discrete GPU's GOP driver is usually signed
+# by "Microsoft Corporation UEFI CA 2011", and that is the same CA that vouches
+# for shim. Once it is in db for the GPU, a custom hierarchy trusts the same set
+# the factory one did and buys nothing but a key-clear. Check before assuming —
+# SECUREBOOT.md "The option ROM that decides this" has the procedure.
+secureboot_mode: own-keys
+
+secureboot_dir: /etc/secureboot/keys
+# Where certificates are staged for the firmware's own file browser, relative to
+# uki_esp_mount. It has to be on the ESP: firmware cannot read secureboot_dir,
+# which lives on the root LV inside the LUKS2 container.
+secureboot_esp_key_dir: EFI/keys
+# What firmware will accept. The MOK: same key roles/uki signs images with.
+secureboot_db_cert: "{{ mok_cert }}"
+# PK and KEK are generated SEPARATELY from the signing key on purpose. The
+# signing key sits on the running root because update-uki needs it unattended;
+# PK/KEK are only needed to change policy. Keep them distinct and a compromised
+# signing key costs you db, not the platform.
+secureboot_cn_prefix: "lmde7-fde"
+secureboot_days: 3650
+secureboot_key_bits: 4096
+# Keep the existing vendor certificate in db alongside yours. Some option
+# ROMs — dGPU, Thunderbolt, some NICs — are signed by the vendor and may not
+# initialise under Secure Boot without it. Cheap hedge; set false for a db
+# containing literally nothing but your own key.
+secureboot_keep_vendor_db: true
+# Refuse to hand firmware a certificate that cannot verify this machine's own
+# UKIs. own-keys checks the newest image before writing db; append-mok checks
+# EVERY image on the ESP, because uki_retain keeps the older ones as the
+# fallback and a fallback firmware will not load is not a fallback. That
+# mistake costs a firmware trip and is entirely preventable.
+secureboot_require_bootable: true
+# own-keys ONLY; append-mok ignores it, having no way to write firmware at all.
+# Generating and staging keys changes no firmware state and is safe any time.
+# Writing PK/KEK/db is the step that commits. Safe to leave true: the role only
+# writes while the firmware is in setup mode, and once PK holds our own
+# Platform Key it reports "already owned" and does nothing.
+secureboot_enroll: true
+secureboot_packages:
+  - efitools
+  - sbsigntool
+
+# --- Kernel: build upstream, sign with the MOK, package, install -------------
+# Adapted from ~/git/scripts/kernel/{build-latest-kernel,make-kernel-deb}.sh.
+# OFF by default: a build is a deliberate forty-minute act, and finalize.yml
+# never runs it (the live ISO has no toolchain and no room).
+kernel_build_enabled: false
+kernel_version: ""            # empty = latest stable from kernel.org releases.json
+kernel_localversion: ""       # appended to the release string, e.g. "-fde"
+kernel_seed_config: ""        # empty = /boot/config-$(uname -r) in the target
+
+# WHERE THE BUILD RUNS. Not /tmp and not /var/tmp: this project's own CIS fstab
+# mounts both noexec, and a kernel build executes the tools it just compiled out
+# of its own source tree (scripts/basic/fixdep, objtool) thousands of times —
+# noexec fails it about ninety seconds in. /var is only 32 GiB, which a
+# DEBUG_INFO tree overruns. /home is the LV with room. Both facts are asserted
+# before the build starts rather than discovered forty minutes into it.
+kernel_build_dir: /home/kernel-build
+kernel_build_min_free_gib: 60
+
+# CONFIG_DEBUG_INFO. true keeps the seed config's setting (object tree 30-50 GiB,
+# and a ~1 GiB -dbg package). false shrinks the tree about fivefold but also
+# drops CONFIG_DEBUG_INFO_BTF, which silently breaks bpftrace/bcc and anything
+# else wanting BTF. Losing eBPF to save disk should be a deliberate choice.
+kernel_debug_info: true
+kernel_build_dbg_package: false   # the -dbg deb was 1.0 GiB on the last real build
+
+kernel_sign_image: true       # sbsign the vmlinuz INSIDE the .deb, so the
+                              # published package is signed, not just this /boot
+kernel_sign_modules: true     # CONFIG_MODULE_SIG_KEY -> mok_pem, instead of the
+                              # ephemeral certs/signing_key.pem the build invents
+kernel_install: true          # dpkg -i the freshly built packages
+kernel_keep_all: true         # apt NeverAutoRemove for kernels + un-submenu'd GRUB
+
+# Block the distribution's kernel packages, so the self-built MOK-signed kernel
+# is the only one apt can install or upgrade. Companion to kernel_keep_all, not
+# a rival: that one stops old kernels being REMOVED, this one stops new ones
+# being ADDED. Full reasoning and the cost: BOOTPOLICY.md section 3.
+#
+# THE COST IS REAL: the distro kernels already on disk stop getting security
+# updates. Your own kernel becomes the only one that gets fixes, and only when
+# you run kernel-build.yml. This is a commitment to a maintenance habit.
+kernel_hold_distro: true
+# Scoped by apt ORIGIN, not by package name, so your own repo (kernel_repo_url)
+# can still ship signed kernels while the distribution's cannot. `apt-cache
+# policy` prints the origins a machine actually has; on this tree they are
+# Debian, Debian Backports and linuxmint.
+kernel_hold_origins:
+  - Debian
+  - Debian Backports
+  - linuxmint
+# linux-libc-dev is deliberately absent: it is a glibc build dependency rather
+# than a kernel, and pinning it out breaks unrelated upgrades.
+kernel_hold_packages:
+  - linux-image-*
+  - linux-headers-*
+  - linux-modules-*
+  - linux-kbuild-*
+
+# Build dependencies — requirements.txt from the source scripts, plus the two
+# this tree adds for signing.
+kernel_build_packages:
+  - build-essential
+  - bc
+  - bison
+  - flex
+  - libssl-dev
+  - libelf-dev
+  - dwarves
+  - libdw-dev
+  - fakeroot
+  - libncurses-dev
+  - rsync
+  - dpkg-dev
+  - kmod
+  - cpio
+  - curl
+  - python3
+  - debhelper
+  - sbsigntool            # sbsign, for the kernel image
+  - mokutil               # enrollment + --generate-hash
+
+# --- Kernel repo: SERVER MODE (publish) and CLIENT MODE (consume) ------------
+# Both halves are off by default and deliberately independent: the machine that
+# builds need not be a machine that installs. See KERNEL.md "Server mode".
+#
+# EXAMPLE — a populated publisher, for copying:
+#
+#   kernel_repo_publish: true
+#   kernel_repo_host: repo.home.arpa
+#   kernel_repo_user: repoadmin
+#   kernel_repo_ssh_key: /root/.ssh/id_ed25519_repo
+#   kernel_repo_incoming: /srv/apt/incoming
+#   kernel_repo_basedir: /srv/apt/lmde7      # reprepro -b lives here
+#   kernel_repo_suite: gigi                  # matches conf/distributions Codename:
+#
+# and the matching consumer on every machine that should get the kernel:
+#
+#   kernel_repo_client: true
+#   kernel_repo_url: "https://repo.home.arpa/lmde7"
+#   kernel_repo_suite: gigi
+#   kernel_repo_components: main
+#   kernel_repo_gpg_key: |
+#     -----BEGIN PGP PUBLIC KEY BLOCK-----
+#     mDMEZ...the repo's PUBLIC key; reprepro signs Release with the private
+#     half, which this playbook never sees and must never carry...
+#     -----END PGP PUBLIC KEY BLOCK-----
+#
+# The repo host needs reprepro and a conf/distributions naming the same codename
+# and a SignWith: key. Nothing here creates it; that is the server's own setup.
+kernel_repo_publish: false
+kernel_repo_host: ""
+kernel_repo_user: ""
+kernel_repo_ssh_key: ""
+kernel_repo_incoming: ""
+kernel_repo_basedir: ""
+kernel_repo_suite: ""
+
+kernel_repo_client: false
+kernel_repo_url: ""
+kernel_repo_components: "main"
+kernel_repo_gpg_key: ""       # ASCII-armoured PUBLIC key. Empty + client on is
+                              # refused: a repo added trusted=yes could ship an
+                              # unsigned kernel and undo everything above.
+
+# --- SELinux (mandatory access control) ---------------------------------------
+# Replaces AppArmor with Debian's SELinux reference policy on the installed
+# system. Full design notes, the promotion path and the escape hatches: SELINUX.md.
+#
+# Ships PERMISSIVE on purpose. A refpolicy desktop that has never been run
+# permissive is a desktop you cannot log into; permissive loads the policy,
+# labels every file and logs every would-be denial, so promoting to enforcing
+# later is backed by an audit log instead of by hope.
+selinux_enabled: true
+# permissive | enforcing. "disabled" is deliberately NOT a legal value: runtime
+# disable was removed from the kernel in 6.4 and CONFIG_SECURITY_SELINUX_DISABLE
+# is absent from LMDE 7's kernel, so SELINUX=disabled in /etc/selinux/config is
+# a no-op trap. Turn SELinux off with selinux_enabled: false, which removes the
+# kernel command line argument instead.
+selinux_mode: permissive
+# default | mls. Must match the selinux-policy-* package in selinux_packages;
+# the role asserts that it does.
+selinux_policy_type: default
+
+# When the full filesystem relabel is scheduled (it runs at the next boot, which
+# then reboots itself — see SELINUX.md "The boot sequence after finalize"):
+#   auto   - only when the target looks unlabelled (security.selinux missing
+#            from /etc/fstab's xattrs). The normal path: first run relabels,
+#            later reruns do not.
+#   always - every run. Use once after changing selinux_policy_type, adding
+#            semanage fcontext rules, or installing policy modules.
+#   never  - never schedule one.
+selinux_relabel_mode: auto
+
+# Appended to GRUB_CMDLINE_LINUX_DEFAULT via a drop-in of its own, AND compiled
+# into /usr/local/sbin/update-uki — with uki_enabled the embedded cmdline is the
+# only one that applies, so both paths have to carry it.
+#   security=selinux       the one switch that actually enables SELinux on this
+#                          kernel (selinux=1 does nothing: BOOTPARAM is unset)
+#   audit=1                audit subsystem up from early boot, so AVC denials
+#                          before auditd starts are not lost
+#   audit_backlog_limit    CIS; keeps early-boot records from being dropped
+selinux_cmdline: "security=selinux audit=1 audit_backlog_limit=8192"
+
+# AppArmor and SELinux are both LSM_FLAG_EXCLUSIVE — the kernel initialises
+# exactly one. apparmor.service is DISABLED but deliberately NOT masked: its
+# ConditionSecurity=apparmor already makes it inert, while masking makes every
+# maintainer script that touches AppArmor fail loudly ("Unit apparmor.service is
+# masked" — Discord's postinst hit exactly that). Disabled, systemctl
+# start/restart/try-reload-or-restart all succeed silently. Symmetric:
+# selinux_enabled=false re-enables it, and unmasks, repairing boxes an earlier
+# version of this role masked.
+selinux_disable_apparmor: true
+
+# auditd is what makes ausearch/audit2allow usable, and what finally puts the
+# var_log_audit LV to work. Turning it off while audit=1 remains on the cmdline
+# leaves kernel audit records going to the ring buffer with nothing collecting
+# them.
+selinux_install_auditd: true
+
+# name: true/false, applied with "semanage boolean -m -N" (-N = no policy
+# reload, the only form that works offline in a chroot). Empty by default:
+# with the unconfined module enabled a desktop needs none of them out of the
+# box. Add what your denial log actually asks for.
+# Measured with Steam running and a game launched: the desktop (Cinnamon, 19
+# denials) and Steam's inspect-library both want execmem, and allow_execmem
+# ships off. Uncomment before going enforcing on a box you play games on —
+# SELINUX.md "Steam, games, and the desktop under enforcing" has the evidence,
+# plus the one Steam denial a boolean CANNOT fix (pressure-vessel's
+# nnp_transition, which needs a small local policy module).
+selinux_booleans: {}
+# selinux_booleans:
+#   allow_execmem: true
+
+selinux_packages:
+  - selinux-basics             # check-selinux-installation, selinux-activate
+  - selinux-policy-default     # refpolicy; ~350 modules, unconfined enabled
+  - selinux-utils              # selinuxenabled, getenforce, setenforce, avcstat
+  - policycoreutils            # restorecon, fixfiles, semodule, sestatus
+  - policycoreutils-python-utils   # semanage, audit2allow
+  - semodule-utils
+  - checkpolicy
+  - setools                    # seinfo, sesearch
+                               # NOT mcstrans: selinux-policy-default Conflicts it
+
+selinux_audit_packages:
+  - auditd
+  - audispd-plugins
+
+# --- finalize behaviour ------------------------------------------------------
+target_mount: /target        # where the installed system is (re)mounted
+finalize_teardown: false      # cleanly unmount + close everything at the end
+
+# --- Packages ----------------------------------------------------------------
+live_packages:
+  - util-linux
+  - fdisk
+  - parted
+  - cryptsetup
+  - lvm2
+  - dosfstools
+  - e2fsprogs
+  - f2fs-tools
+  - fscrypt
+  - systemd-cryptsetup       # systemd-cryptenroll + LUKS token plugins
+  - tpm2-tools
+  - rsync
+  - python3-pexpect
+
+target_packages:
+  - cryptsetup
+  - cryptsetup-initramfs
+  - lvm2
+  - f2fs-tools
+  - fscrypt
+  - systemd-cryptsetup
+  - tpm2-tools
+
+target_packages_pam:
+  - libpam-fscrypt
+
+# Convenience packages: installed into the target but NOT boot-critical.
+# Installed in a separate, non-fatal task so a missing/broken package here can
+# never abort finalize before crypttab and fstab are written.
+target_packages_extra:
+  - steam
+  - gimp
+  - secure-delete
+  - openssh-server
+  - python3-venv
+  - python3-tk
+  - python3-dev
+  - python3-pip
+  - ansible
+  - vim
+  - gdebi-core
+  - ffmpeg
+  - tesseract-ocr
+  - libxcb-shm0-dev
+  - libxcb1-dev
+  - xdotool
+  - yubikey-manager
+  - fido2-tools
+#  - rocminfo
+                             # Debian's ansible bundles community.general +
+                             # community.crypto, so the post-boot rerun
+                             # (e.g. flipping uki_enabled) needs nothing else
+
+uki_packages:
+  - systemd-ukify
+  - systemd-boot-efi         # provides the EFI stub ukify wraps around
+  - efibootmgr
+  - sbsigntool

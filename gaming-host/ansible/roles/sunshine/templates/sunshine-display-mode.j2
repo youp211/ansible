@@ -1,0 +1,99 @@
+#!/bin/sh
+# Managed by Ansible (gaming-host). See PERFORMANCE-NOTES.md.
+#
+# Matches the host display mode to what the Moonlight client actually asked for,
+# for the duration of a stream, then restores the desktop mode afterwards.
+#
+# Why this matters: a 4K144 host panel serving a 1080p60 client renders ~4x the
+# pixels and ~2.4x the frames that ever reach the client, and Sunshine
+# downscales every frame on top of that. Measured before this change: GPU pinned
+# at 100% busy and at its power cap.
+#
+# Invoked by Sunshine's global_prep_cmd, which sets SUNSHINE_CLIENT_WIDTH /
+# _HEIGHT / _FPS. Falls back to the desktop mode if those are absent or the
+# requested mode does not exist, so a bad value can never leave the desktop
+# stranded in an unusable mode.
+set -u
+
+OUTPUT="{{ sunshine_display_output }}"
+DESKTOP_MODE="{{ sunshine_desktop_mode }}"
+DESKTOP_RATE="{{ sunshine_desktop_rate }}"
+
+# xrandr needs these; Sunshine inherits them from the desktop session, but be
+# explicit so the script also works when run by hand over SSH.
+export DISPLAY="${DISPLAY:-:0}"
+export XAUTHORITY="${XAUTHORITY:-/home/{{ target_user }}/.Xauthority}"
+
+log() { echo "sunshine-display-mode: $*" >&2; }
+
+restore() {
+    log "restoring ${OUTPUT} to ${DESKTOP_MODE}@${DESKTOP_RATE}"
+    xrandr --output "$OUTPUT" --mode "$DESKTOP_MODE" --rate "$DESKTOP_RATE"
+}
+
+case "${1:-}" in
+start)
+    W="${SUNSHINE_CLIENT_WIDTH:-}"
+    H="${SUNSHINE_CLIENT_HEIGHT:-}"
+    F="${SUNSHINE_CLIENT_FPS:-}"
+
+    if [ -z "$W" ] || [ -z "$H" ]; then
+        log "client resolution not provided, leaving display mode alone"
+        exit 0
+    fi
+
+    MODE="${W}x${H}"
+
+    # Only switch to a mode the output actually advertises. Asking xrandr for a
+    # nonexistent mode fails and would leave the desktop as-is anyway, but
+    # checking first keeps the log honest about what happened.
+    if ! xrandr | grep -qE "^[[:space:]]+${MODE}[[:space:]]"; then
+        log "mode ${MODE} not available on ${OUTPUT}, leaving display mode alone"
+        exit 0
+    fi
+
+    if [ -n "$F" ]; then
+        # The client's requested fps is rarely an exact advertised rate (a 120
+        # fps client on a panel offering 143.98/60/59.94 would simply fail
+        # --rate and land on an arbitrary default). Pick the lowest advertised
+        # rate that still covers the request, so frames are never dropped for
+        # want of refresh; fall back to the highest rate the mode offers.
+        RATE=$(xrandr | awk -v mode="$MODE" -v want="$F" '
+            $1 == mode {
+                best = 0; pick = 0; bestdiff = -1
+                for (i = 2; i <= NF; i++) {
+                    r = $i; gsub(/[*+]/, "", r); r = r + 0
+                    if (r <= 0) continue
+                    if (r > best) best = r
+                    # Among rates that cover the request (0.5 tolerance, so
+                    # 59.94 still counts for a 60 fps client), take the CLOSEST
+                    # one - not merely the lowest. A panel offering both 59.94
+                    # and 60.00 should give an exact 60 to a 60 fps client
+                    # rather than drifting a frame every ~16 seconds.
+                    if (r >= want - 0.5) {
+                        d = r - want; if (d < 0) d = -d
+                        if (bestdiff < 0 || d < bestdiff) { bestdiff = d; pick = r }
+                    }
+                }
+                printf "%s", (pick > 0 ? pick : best)
+                exit
+            }')
+
+        if [ -n "$RATE" ]; then
+            log "client asked ${MODE}@${F}; using nearest advertised ${RATE}Hz"
+            xrandr --output "$OUTPUT" --mode "$MODE" --rate "$RATE" && exit 0
+            log "rate ${RATE} rejected by xrandr, falling back to mode default"
+        fi
+    fi
+
+    log "switching ${OUTPUT} to ${MODE} at the output default rate"
+    xrandr --output "$OUTPUT" --mode "$MODE"
+    ;;
+stop)
+    restore
+    ;;
+*)
+    echo "usage: $0 start|stop" >&2
+    exit 2
+    ;;
+esac

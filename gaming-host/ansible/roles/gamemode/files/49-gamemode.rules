@@ -1,0 +1,20 @@
+// Managed by Ansible (gaming-host). See PERFORMANCE-NOTES.md.
+//
+// Debian ships com.feralinteractive.GameMode.policy with allow_any, allow_inactive
+// AND allow_active all set to "no", so no session is ever authorized to run
+// GameMode's privileged helpers. The result is silent failure: gamemoded starts
+// fine and reports "GameMode started", but every helper is refused by pkexec
+// ("Not authorized"), so the governor is never raised, split_lock_mitigate is
+// never toggled, and `gamemoded -t` fails its governor test.
+//
+// Restricted to the sudo group rather than allow_active, so a random logged-in
+// account cannot drive CPU/GPU power state.
+
+polkit.addRule(function (action, subject) {
+    if (action.id.indexOf("com.feralinteractive.GameMode.") !== 0) {
+        return;
+    }
+    if (subject.isInGroup("sudo") && subject.local) {
+        return polkit.Result.YES;
+    }
+});

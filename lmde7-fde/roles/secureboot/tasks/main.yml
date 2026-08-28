@@ -1,0 +1,53 @@
+---
+# Secure Boot. Two routes, chosen by secureboot_mode — see SECUREBOOT.md.
+#
+#   append-mok  keep the factory PK/KEK/db and add ONE certificate to db: the
+#               MOK that signs the UKIs. Writes no firmware variable (it cannot
+#               — that needs a KEK we do not hold); it stages the certificate on
+#               the ESP and tells you the firmware steps. The right answer on a
+#               machine whose db must keep a vendor CA anyway.
+#   own-keys    replace the factory PK/KEK/db with a hierarchy you own. Firmware
+#               then loads nothing you did not sign. Needs setup mode, which is
+#               a firmware action by design.
+#
+# Split deliberately in both routes: generating and staging changes no firmware
+# state and is safe to run any time. Only own-keys can commit, and only behind
+# secureboot_enroll.
+
+- name: Secure Boot handling disabled (secureboot_enabled=false)
+  ansible.builtin.debug:
+    msg: >-
+      secureboot_enabled=false — the factory key hierarchy is left alone and
+      nothing is staged. This machine boots whatever its vendor and Microsoft
+      vouched for, and its own UKIs are not among them. See SECUREBOOT.md for
+      what the two routes buy and what they cost.
+  when: not secureboot_enabled | bool
+
+- name: Install the key-management tooling
+  ansible.builtin.import_tasks: packages.yml
+  when: secureboot_enabled | bool
+
+# --- Route: append the MOK to the factory db ---------------------------------
+- name: Stage the MOK for a firmware-side db append
+  ansible.builtin.import_tasks: stage_mok.yml
+  when:
+    - secureboot_enabled | bool
+    - secureboot_mode == 'append-mok'
+
+# --- Route: own the platform keys --------------------------------------------
+- name: Generate the platform key hierarchy
+  ansible.builtin.import_tasks: generate.yml
+  when:
+    - secureboot_enabled | bool
+    - secureboot_mode == 'own-keys'
+
+- name: Enrol the hierarchy into firmware
+  ansible.builtin.import_tasks: enroll.yml
+  when:
+    - secureboot_enabled | bool
+    - secureboot_mode == 'own-keys'
+    - secureboot_enroll | bool
+
+- name: Report what still needs doing
+  ansible.builtin.import_tasks: status.yml
+  when: secureboot_enabled | bool

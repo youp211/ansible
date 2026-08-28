@@ -1,0 +1,51 @@
+---
+# Block (or unblock) the distribution's kernel packages. See BOOTPOLICY.md
+# section 3 for the reasoning and the maintenance cost this takes on.
+
+- name: Block the distribution's kernel packages
+  when: kernel_hold_distro | bool
+  block:
+    - name: Pin distro kernels out of apt's reach
+      ansible.builtin.template:
+        src: 99-fde-kernel-hold.pref.j2
+        dest: "{{ target_mount }}/etc/apt/preferences.d/99-fde-kernel-hold.pref"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Read back what apt now considers installable
+      # The pin is only worth having if apt agrees it exists. Non-fatal: a
+      # target with no package lists yet (fresh live-ISO chroot) cannot answer,
+      # and that is not a reason to fail a run.
+      ansible.builtin.command: chroot {{ target_mount }} apt-cache policy linux-image-amd64
+      register: kernel_hold_policy
+      changed_when: false
+      failed_when: false
+
+    - name: Show the effect of the pin
+      ansible.builtin.debug:
+        msg: >-
+          {{ kernel_hold_policy.stdout_lines
+             if kernel_hold_policy.rc == 0
+             else ['apt-cache could not answer in the target (rc=' ~ kernel_hold_policy.rc ~
+                   '); the pin file is written, check it after the next apt update.'] }}
+
+    - name: Warn when the pin did not take
+      # "Candidate: (none)" is the signal that every archive version is now
+      # priority -1. Anything else means the origins in kernel_hold_origins do
+      # not match this machine — run `apt-cache policy` on it and fix the list.
+      ansible.builtin.debug:
+        msg: >-
+          kernel_hold_distro is on, but apt still offers a candidate for
+          linux-image-amd64. The origins in kernel_hold_origins
+          ({{ kernel_hold_origins | join(', ') }}) probably do not match this
+          machine — `apt-cache policy` prints the ones it really has.
+      when:
+        - kernel_hold_policy.rc == 0
+        - "'Candidate: (none)' not in kernel_hold_policy.stdout"
+
+- name: Lift the block on the distribution's kernel packages
+  ansible.builtin.file:
+    path: "{{ target_mount }}/etc/apt/preferences.d/99-fde-kernel-hold.pref"
+    state: absent
+  when: not kernel_hold_distro | bool

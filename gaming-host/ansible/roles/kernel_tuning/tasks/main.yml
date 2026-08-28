@@ -1,0 +1,40 @@
+---
+- name: Persist gaming/streaming sysctl tunables
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/99-gaming.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (gaming-host). See PERFORMANCE-NOTES.md.
+
+      # 32 GB RAM with
+      # 63GB swap that never gets touched under load; default 60 is needlessly
+      # eager to swap out a running game's working set.
+      vm.swappiness = 10
+
+      # Favor keeping game asset dentry/inode cache over reclaiming it.
+      vm.vfs_cache_pressure = 50
+
+      # Sunshine streams 1080p60 over UDP. 4MB socket buffers would cope, but
+      # the stream is over Wi-Fi, where bursty I-frames meet variable latency;
+      # 16MB absorbs that jitter cheaply (these are caps, not allocations).
+      net.core.rmem_max = 16777216
+      net.core.wmem_max = 16777216
+  notify: Reload sysctl
+
+- name: Grant negative-nice rlimit so GameMode/Sunshine can raise thread priority
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/security/limits.d/99-gaming-nice.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      # Managed by Ansible (gaming-host).
+      # Without this the login session caps RLIMIT_NICE at 0 and Sunshine logs
+      # "setpriority failed for nice -15: Permission denied" / missing CAP_SYS_NICE,
+      # so its encode threads cannot be prioritized. Takes effect at next login.
+      {{ target_user }}   soft   nice   -19
+      {{ target_user }}   hard   nice   -19

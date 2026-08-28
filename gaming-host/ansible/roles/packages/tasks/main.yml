@@ -1,0 +1,14 @@
+---
+- name: Install gaming and monitoring packages
+  become: true
+  ansible.builtin.apt:
+    name:
+      - gamemode          # per-game governor/ioprio/nice switching
+      - mangohud          # in-game frame-time and utilization overlay
+      - linux-cpupower    # cpupower CLI for frequency inspection
+      - lm-sensors        # temperature sensors (already in use)
+      - vainfo            # VAAPI hardware encode/decode verification
+      - stress-ng         # synthetic load, for controlled A/B measurements
+    state: present
+    update_cache: true
+    cache_valid_time: 3600

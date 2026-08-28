@@ -1,0 +1,63 @@
+---
+# SECURE BOOT — make firmware trust this machine's own boot images.
+#
+# Two routes, chosen by secureboot_mode (see SECUREBOOT.md):
+#
+#   append-mok  Keep the factory PK/KEK/db and add ONE certificate to db: the
+#               MOK that signs the UKIs. Writes NO firmware variable — it
+#               cannot, since an append outside setup mode needs a KEK-signed
+#               update only the board vendor can produce. The role stages the
+#               certificate on the ESP and prints the firmware steps, and the
+#               append is a keystroke in firmware setup. Safe to run any time.
+#
+#                 sudo ansible-playbook secureboot.yml -e target_mount=/
+#
+#   own-keys    Replace the factory PK/KEK/db with a hierarchy you own, so
+#               firmware loads nothing you did not sign.
+#
+#                 sudo ansible-playbook secureboot.yml -e target_mount=/
+#                 sudo ansible-playbook secureboot.yml -e target_mount=/ -e secureboot_enroll=true
+#
+#               Generating keys changes no firmware state and is safe any time.
+#               Enrolment writes platform policy and needs the firmware in SETUP
+#               MODE, which only you can arrange: firmware setup -> clear the
+#               Secure Boot keys. That is by design — if software could clear
+#               PK, Secure Boot would be worthless. And with a db holding only
+#               your key, shim and GRUB stop loading under Secure Boot, so the
+#               only thing that boots is a UKI you signed; recovery is turning
+#               Secure Boot off in firmware.
+#
+# Read SECUREBOOT.md first. On a dual-boot machine, or one whose discrete GPU
+# has a Microsoft-signed option ROM, own-keys is usually the wrong answer and
+# the reasons are measurable before you commit to either.
+#
+# EITHER ROUTE: turning Secure Boot on moves PCR 7, so the TPM2 keyslot sealed
+# to it will not unseal. Expect the recovery passphrase once, then re-seal with
+# tpm2.yml.
+
+- name: "Secure Boot: make firmware trust this machine's images"
+  hosts: live
+  become: true
+
+  pre_tasks:
+    - name: Look for an installed system at the target mount
+      ansible.builtin.stat:
+        path: "{{ target_mount }}/etc/os-release"
+      register: sb_target_os
+
+    - name: Assert the target holds an installed system
+      ansible.builtin.assert:
+        that: sb_target_os.stat.exists
+        fail_msg: >-
+          No {{ target_mount }}/etc/os-release — nothing is installed there.
+          On the booted system run this with -e target_mount=/ .
+        success_msg: "Installed system found at {{ target_mount }}."
+
+  roles:
+    # roles/mok first: both routes hand the MOK to firmware, so it has to exist
+    # before signature lists are built (own-keys) or staged on the ESP
+    # (append-mok). Generation only — enrolling a MOK into MokList is shim's
+    # database, and neither route boots through shim.
+    - config_contract
+    - mok
+    - secureboot

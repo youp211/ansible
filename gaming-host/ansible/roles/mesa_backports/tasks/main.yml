@@ -1,0 +1,41 @@
+---
+# OPT-IN ONLY: ansible-playbook site.yml --ask-become-pass --tags mesa
+#
+# Installed: Mesa 25.0.7 (trixie). Available: Mesa 26.1.2 (trixie-backports).
+# That gap covers a substantial amount of RADV/RDNA3 work for Navi 31 (this is a
+# recent AMD cards), so it is one of the few changes here likely to move actual frame
+# rates rather than just frame-time consistency.
+#
+# Not run by default because it swaps the graphics stack out from under a running
+# session: the game and the desktop must be restarted for it to take effect, and
+# a regression means rolling back a large set of libraries. Do it between
+# sessions, not mid-stream.
+#
+# Rollback if a regression appears:
+#   sudo apt install --allow-downgrades \
+#     'libgl1-mesa-dri/trixie' 'mesa-vulkan-drivers/trixie' \
+#     'mesa-va-drivers/trixie' 'libegl-mesa0/trixie' 'libgbm1/trixie'
+
+# noqa: package-latest - upgrading in place IS the purpose of this role. These
+# are the Debian-packaged Mesa libraries; backports replaces the same packages
+# rather than installing a parallel stack.
+- name: Upgrade Mesa graphics stack from backports # noqa: package-latest
+  become: true
+  ansible.builtin.apt:
+    name:
+      # mesa-va-drivers is deliberately absent. As of Mesa 26.x Debian merged the
+      # VAAPI drivers into mesa-libgallium, which carries
+      # "Provides: mesa-va-drivers, va-driver" and Replaces/Breaks the standalone
+      # package. Listing it here would deadlock: backports still only has
+      # mesa-va-drivers 25.2.6 while mesa-libgallium is 26.1.2, and the latter
+      # Breaks the former. Hardware VAAPI encode is preserved by the Provides -
+      # verify with vainfo after upgrading.
+      - libgl1-mesa-dri
+      - mesa-vulkan-drivers
+      - libegl-mesa0
+      - libgbm1
+      - mesa-libgallium
+    state: latest
+    default_release: trixie-backports
+    update_cache: true
+  notify: Report Mesa upgrade

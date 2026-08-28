@@ -1,0 +1,137 @@
+---
+# GRUB BOOT POLICY — which entries the menu is allowed to offer. BOOTPOLICY.md
+# carries the full reasoning; the short version:
+#
+# Debian's /etc/grub.d/10_linux emits a classic linux/initrd entry for every
+# kernel in /boot plus a recovery variant, and sorts BEFORE 25_uki — so the
+# unsigned, unmeasured, cmdline-editable path is also the default one. There is
+# no configuration knob to filter it: 10_linux hardcodes its kernel globs. The
+# only lever is the executable bit, because grub-mkconfig gates every drop-in on
+# "test -x".
+#
+# Deliberately outside the uki_enabled block in main.yml: flipping uki_enabled
+# back to false must RESTORE 10_linux, not leave it suppressed with nothing to
+# replace it. The config contract enforces that a non-"all" policy implies
+# uki_enabled, so reading uki_boot_policy directly here is safe.
+#
+# Callers regenerate grub.cfg afterwards (finalize.yml and uki.yml both do) —
+# nothing here writes the menu, it only decides who is allowed to write it.
+
+- name: Look for Debian's classic GRUB kernel entry generator
+  ansible.builtin.stat:
+    path: "{{ target_mount }}/etc/grub.d/10_linux"
+  register: uki_10_linux
+
+- name: Warn that the boot policy cannot be applied yet
+  # Not a failure: an expert-mode install can reach finalize with no bootloader
+  # packages yet, and finalize installs them in a post_task AFTER this role.
+  # Re-running finalize once grub-common exists applies the policy.
+  ansible.builtin.debug:
+    msg: >-
+      /etc/grub.d/10_linux is missing, so uki_boot_policy={{ uki_boot_policy }}
+      was NOT applied. grub-common is not installed in the target yet. Re-run
+      this playbook after it is — the GRUB menu is otherwise whatever the
+      bootloader packages ship by default.
+  when: not uki_10_linux.stat.exists
+
+- name: Apply the GRUB boot policy
+  when: uki_10_linux.stat.exists
+  block:
+    - name: Count the signed UKIs the menu would be left with
+      # Runs after the build stage in main.yml on purpose, so this reflects the
+      # images THIS run produced rather than the ones it started with.
+      ansible.builtin.find:
+        paths: "{{ target_mount }}{{ uki_esp_mount }}/{{ uki_dir }}"
+        patterns: "*.efi"
+        file_type: file
+      register: uki_on_esp
+
+    - name: Refuse to suppress the classic entries with no UKI to replace them
+      ansible.builtin.assert:
+        that: uki_on_esp.matched | int > 0
+        fail_msg: >-
+          uki_boot_policy={{ uki_boot_policy }} would take the executable bit
+          off /etc/grub.d/10_linux, but
+          {{ target_mount }}{{ uki_esp_mount }}/{{ uki_dir }} holds no .efi —
+          the menu would offer no way to start Linux at all. Check that the ESP
+          is mounted and that update-uki succeeded, or set
+          uki_boot_policy=all in group_vars/all.yml. See BOOTPOLICY.md.
+        success_msg: >-
+          {{ uki_on_esp.matched }} UKI(s) on the ESP will back the menu under
+          uki_boot_policy={{ uki_boot_policy }}.
+      when: uki_boot_policy != 'all'
+
+    - name: Install the UKI-backed classic entry generator
+      ansible.builtin.template:
+        src: 26_fde_linux.j2
+        dest: "{{ target_mount }}/etc/grub.d/26_fde_linux"
+        owner: root
+        group: root
+        mode: "0755"
+      when: uki_boot_policy == 'uki-backed'
+
+    - name: Remove the UKI-backed classic entry generator
+      ansible.builtin.file:
+        path: "{{ target_mount }}/etc/grub.d/26_fde_linux"
+        state: absent
+      when: uki_boot_policy != 'uki-backed'
+
+    - name: Read the current statoverride for 10_linux
+      # Unconditional, so the tasks below can reference .rc without tripping the
+      # when-list short-circuit trap documented in CLAUDE.md. rc 0 = an override
+      # exists, rc 1 = none.
+      ansible.builtin.command: chroot {{ target_mount }} dpkg-statoverride --list /etc/grub.d/10_linux
+      register: uki_statoverride
+      changed_when: false
+      failed_when: false
+
+    - name: Suppress the classic GRUB kernel entries
+      when: uki_boot_policy != 'all'
+      block:
+        - name: Take the executable bit off 10_linux
+          ansible.builtin.file:
+            path: "{{ target_mount }}/etc/grub.d/10_linux"
+            owner: root
+            group: root
+            mode: "0644"
+
+        - name: Pin that mode so a grub-common upgrade cannot undo it
+          # 10_linux is a CONFFILE. Without an override dpkg restores 0755 when
+          # it unpacks a new grub-common — silently re-enabling every classic
+          # entry during a security update, which is the worst possible moment
+          # to quietly widen the boot surface.
+          ansible.builtin.command: >-
+            chroot {{ target_mount }} dpkg-statoverride --update --add
+            root root 0644 /etc/grub.d/10_linux
+          when: uki_statoverride.rc != 0
+          changed_when: true
+
+    - name: Restore the stock GRUB menu
+      when: uki_boot_policy == 'all'
+      block:
+        - name: Drop the statoverride on 10_linux
+          # --remove does not restore the mode; the next task does that.
+          ansible.builtin.command: chroot {{ target_mount }} dpkg-statoverride --remove /etc/grub.d/10_linux
+          when: uki_statoverride.rc == 0
+          changed_when: true
+
+        - name: Give 10_linux its executable bit back
+          ansible.builtin.file:
+            path: "{{ target_mount }}/etc/grub.d/10_linux"
+            owner: root
+            group: root
+            mode: "0755"
+
+    - name: Boot policy in effect
+      ansible.builtin.debug:
+        msg: >-
+          uki_boot_policy={{ uki_boot_policy }}:
+          {{ 'the GRUB menu offers signed UKIs only — no classic kernel entries,
+              no recovery mode. Other operating systems (30_os_prober) are
+              unaffected and every kernel is still on disk.'
+             if uki_boot_policy == 'uki-only'
+             else ('UKIs first, then classic entries for the ' ~ uki_on_esp.matched ~
+                   ' kernel(s) that have one. Recovery mode kept for those.'
+                   if uki_boot_policy == 'uki-backed'
+                   else 'stock Debian menu — every kernel in /boot, classic and
+                         recovery, plus the UKI entries.') }}

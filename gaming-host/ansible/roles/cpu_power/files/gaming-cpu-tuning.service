@@ -1,0 +1,17 @@
+[Unit]
+Description=Gaming CPU power tuning (intel_pstate HWP dynamic boost)
+Documentation=https://github.com/youp211/ansible/blob/main/gaming-host/PERFORMANCE-NOTES.md
+After=multi-user.target
+ConditionPathExists=/sys/devices/system/cpu/intel_pstate/hwp_dynamic_boost
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Boost frequency when a core wakes from idle for a bursty/interactive workload.
+# Gives most of the `performance` governor's responsiveness while leaving the
+# governor on `powersave`, so cores idle down instead of pinning at max 24/7.
+# Package temp measured 89C on `performance` vs 86C here at identical load.
+ExecStart=/bin/sh -c 'echo 1 > /sys/devices/system/cpu/intel_pstate/hwp_dynamic_boost'
+
+[Install]
+WantedBy=multi-user.target

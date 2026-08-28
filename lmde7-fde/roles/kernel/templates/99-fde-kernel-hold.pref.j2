@@ -1,0 +1,30 @@
+# managed by lmde7-fde (roles/kernel) — kernel_hold_distro
+#
+# Block the distribution's kernel packages so the self-built, MOK-signed kernel
+# is the only one apt can install or upgrade. Companion to
+# /etc/apt/apt.conf.d/99-keep-all-kernels.conf, which stops old kernels being
+# REMOVED; this stops new ones being ADDED.
+#
+# Scoped by ORIGIN rather than by package name on purpose. Holding a name is
+# useless here: Debian ships each kernel ABI as a NEW package name, pulled in by
+# the linux-image-amd64 metapackage. Scoping by origin blocks the archives while
+# leaving your own repo (kernel_repo_url) free to ship signed kernels normally.
+#
+# Pin-Priority -1 means "never select a version from this release". It does not
+# touch what is already installed: the installed version lives in the a=now
+# pseudo-release and keeps priority 100, so nothing is removed or downgraded.
+# Measured, not assumed — with this file in place `apt-get -s upgrade` reports
+# "0 to remove" and apt-cache policy shows Candidate: (none).
+#
+# linux-libc-dev is deliberately absent: it is a glibc build dependency, not a
+# kernel, and pinning it out breaks unrelated upgrades.
+#
+# Lift it for one command with:
+#   apt -o Dir::Etc::Preferences=/dev/null install <pkg>
+# or permanently with kernel_hold_distro: false and a re-run of kernel.yml.
+{% for origin in kernel_hold_origins %}
+
+Package: {{ kernel_hold_packages | join(' ') }}
+Pin: release o={{ origin }}
+Pin-Priority: -1
+{% endfor %}

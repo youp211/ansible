@@ -1,0 +1,38 @@
+---
+- name: Install CPU power tuning unit
+  become: true
+  ansible.builtin.copy:
+    src: gaming-cpu-tuning.service
+    dest: /etc/systemd/system/gaming-cpu-tuning.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd
+
+- name: Enable and start CPU power tuning
+  become: true
+  ansible.builtin.systemd_service:
+    name: gaming-cpu-tuning.service
+    enabled: true
+    state: started
+    daemon_reload: true
+  # In check mode the unit file above is never written, so systemd cannot see it.
+  when: not ansible_check_mode
+
+# Baseline governor is `powersave`; GameMode raises it to `performance` only for
+# the duration of a game. intel_pstate defaults to powersave, so this is a guard
+# against a leftover manual `performance` setting surviving in the running system.
+- name: Set baseline CPU governor to powersave
+  become: true
+  ansible.builtin.shell: |
+    set -e
+    changed=0
+    for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+      if [ "$(cat "$f")" != "powersave" ]; then
+        echo powersave > "$f"
+        changed=1
+      fi
+    done
+    echo "changed=$changed"
+  register: cpu_power_governor_result
+  changed_when: "'changed=1' in cpu_power_governor_result.stdout"

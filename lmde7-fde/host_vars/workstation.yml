@@ -1,0 +1,60 @@
+---
+# Per-machine overrides. group_vars/all.yml holds the defaults for the machine
+# this tree was built on; anything that differs on THIS box belongs here.
+#
+# This file is shipped as a worked example of the overrides that actually
+# matter, taken from a second machine — a dual-boot desktop with a discrete GPU.
+# Delete what does not apply to yours.
+
+# Only prep.yml checks this, and prep.yml must never run on a machine that is
+# already installed — but a wrong value sitting in the tree is a trap for
+# whoever does run it. Derive it with: lsblk -bdno SIZE <disk> -> bytes // 2^30
+expected_disk_size_gib: 1863
+
+# SECURE BOOT: append-mok, not own-keys. The factory hierarchy stays exactly as
+# the vendor shipped it and gains one certificate.
+#
+# own-keys is only worth the key-clear when db can be reduced to your key alone.
+# Two things commonly stop that, and both are measurable in five minutes
+# (SECUREBOOT.md, "Two routes"):
+#
+#   1. A second OS. A Windows bootmgfw.efi signed only by "Windows UEFI CA 2023"
+#      makes that CA load-bearing:
+#         sbverify --list /mnt/winesp/EFI/Microsoft/Boot/bootmgfw.efi
+#   2. A discrete GPU. Its GOP driver usually carries ONE signature, issued
+#      under "Microsoft Corporation UEFI CA 2011" — the same CA that vouches for
+#      shim. Drop it and the card loses its pre-OS display; keep it and a custom
+#      hierarchy trusts the same set the factory one did.
+#
+# So: keep the factory db, append the MOK, done. The role stages the certificate
+# at <esp>/EFI/keys/MOK.cer with the steps beside it in ENROLL-MOK.txt. The
+# append itself is a firmware keystroke — Key Management -> db Management ->
+# APPEND (never Replace).
+secureboot_enabled: true
+secureboot_mode: append-mok
+# own-keys only, and own-keys is not what runs here. Pinned false so a stray
+# -e secureboot_mode=own-keys cannot also commit the hierarchy in one breath.
+secureboot_enroll: false
+
+# MokList is shim's database, and shim is not in this machine's boot path —
+# firmware loads the UKI directly. A MOK in MokList would not make firmware load
+# anything; only a MOK in db does, which is what append-mok is for. Staging a
+# mokutil --import here would sit in MokNew forever.
+mok_enroll: false
+
+# DUAL BOOT: the other OS lives on a second disk with its own ESP, and os-prober
+# puts it in the GRUB menu. group_vars sets grub_disable_os_prober: true for a
+# single-boot machine, which would remove that entry on the next finalize run.
+grub_disable_os_prober: false
+
+# BOOT POLICY: keep the stock menu until a UKI on THIS machine has been proven to
+# boot. group_vars ships uki_boot_policy: uki-only, which leaves the UKIs as the
+# only Linux entries — correct once firmware has booted one, a needless gamble
+# before. Flip to uki-only (or uki-backed) after the first successful UKI boot.
+# See BOOTPOLICY.md.
+uki_boot_policy: all
+
+# No self-built kernel here yet, so the distribution's kernels are the only ones
+# this machine has; blocking them would freeze it with no source of security
+# updates. Turn on only after kernel-build.yml has produced a signed kernel here.
+kernel_hold_distro: false

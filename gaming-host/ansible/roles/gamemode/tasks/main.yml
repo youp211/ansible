@@ -1,0 +1,35 @@
+---
+- name: Install GameMode configuration
+  become: true
+  ansible.builtin.copy:
+    src: gamemode.ini
+    dest: /etc/gamemode.ini
+    owner: root
+    group: root
+    mode: "0644"
+
+# Without this GameMode is inert: Debian's shipped policy authorizes nobody, so
+# every privileged helper is refused by pkexec and the governor never changes.
+- name: Authorize GameMode privileged helpers via polkit
+  become: true
+  ansible.builtin.copy:
+    src: 49-gamemode.rules
+    dest: /etc/polkit-1/rules.d/49-gamemode.rules
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart polkit
+
+# gamemoded ships disabled on this system, so nothing was ever applying
+# per-game tuning. It is a user service - it must run in the desktop session,
+# not as root, which is why become is explicitly disabled here.
+- name: Enable gamemoded user service
+  become: false
+  ansible.builtin.systemd_service:
+    name: gamemoded.service
+    scope: user
+    enabled: true
+    state: started
+    daemon_reload: true
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid | default(1000) }}"

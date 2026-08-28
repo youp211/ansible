@@ -1,0 +1,7 @@
+---
+- name: Report Mesa upgrade
+  ansible.builtin.debug:
+    msg:
+      - "Mesa upgraded. Log out and back in (or reboot) for the new drivers to load."
+      - "Verify afterwards with: vainfo | grep 'Driver version'"
+      - "and: vulkaninfo --summary | grep driverInfo"

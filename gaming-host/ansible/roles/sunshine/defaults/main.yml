@@ -1,0 +1,16 @@
+---
+# Kept here rather than inline in the config template so the JSON stays on one
+# line for Sunshine (which requires it) without producing an over-long YAML line.
+sunshine_prep_cmd: >-
+  [{"do":"/usr/local/bin/sunshine-display-mode start",
+  "undo":"/usr/local/bin/sunshine-display-mode stop"}]
+
+# The desktop mode the helper restores after a stream ends. Read yours off
+# `xrandr` — the output name and the rate must match what it advertises exactly.
+sunshine_display_output: DisplayPort-1
+sunshine_desktop_mode: "3840x2160"
+sunshine_desktop_rate: "144.00"
+
+# Encoder Sunshine hands frames to. `vaapi` covers AMD and Intel; use `nvenc` on
+# NVIDIA, or `software` if `vainfo` shows no usable profiles.
+sunshine_encoder: vaapi
